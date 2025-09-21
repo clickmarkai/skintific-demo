@@ -22,6 +22,10 @@ const RegisterPage = () => {
 
     try {
       // Sign up with Supabase Auth
+      if (!supabase) {
+        setError('Registration is temporarily unavailable. Missing Supabase configuration.');
+        return;
+      }
       const { data: authData, error: authError } = await supabase.auth.signUp({
         email,
         password,

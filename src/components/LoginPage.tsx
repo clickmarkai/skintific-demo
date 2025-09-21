@@ -22,6 +22,10 @@ const LoginPage = () => {
 
     try {
       // Sign in with Supabase Auth
+      if (!supabase) {
+        setError('Authentication is temporarily unavailable. Missing Supabase configuration.');
+        return;
+      }
       const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
         email,
         password,

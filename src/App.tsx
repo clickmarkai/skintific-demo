@@ -10,6 +10,16 @@ import LoginPage from "@/components/LoginPage";
 import RegisterPage from "@/components/RegisterPage";
 import Index from "./pages/Index";
 import NotFound from "./pages/NotFound";
+import CartPage from "./pages/Cart";
+import ChatWidget from "@/components/ChatWidget";
+import { useAuth } from "@/hooks/useAuth";
+import QRISPage from "./pages/payment/QRIS";
+
+const ChatWidgetGlobal = () => {
+  const { isAuthenticated } = useAuth();
+  if (!isAuthenticated) return null;
+  return <ChatWidget />;
+};
 
 const queryClient = new QueryClient();
 
@@ -29,9 +39,23 @@ const App = () => (
                 <Index />
               </ProtectedRoute>
             } />
+            <Route path="/cart" element={
+              <ProtectedRoute>
+                <Navigation />
+                <CartPage />
+              </ProtectedRoute>
+            } />
+            <Route path="/payment/qris" element={
+              <ProtectedRoute>
+                <Navigation />
+                <QRISPage />
+              </ProtectedRoute>
+            } />
             {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
             <Route path="*" element={<NotFound />} />
           </Routes>
+          {/* Persist chat across routes */}
+          <ChatWidgetGlobal />
         </BrowserRouter>
       </AuthProvider>
     </TooltipProvider>

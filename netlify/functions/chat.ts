@@ -1,0 +1,423 @@
+/*
+  Netlify Function: /chat
+  - Accepts POST with { message, session_id, user_id, user_email, timestamp, source }
+  - Routes intents and returns structured JSON compatible with ChatWidget rich rendering
+  - Minimal in-memory product data and cart store for demo purposes
+*/
+
+import type { Handler } from "@netlify/functions";
+import { createClient } from "@supabase/supabase-js";
+import type { Database } from "../../src/lib/types/database";
+import { PRODUCTS as CAT_PRODUCTS, searchProducts } from "./_productData";
+
+type Intent =
+  | "get_cart_info"
+  | "add_line"
+  | "edit_line"
+  | "delete_line"
+  | "delete_cart"
+  | "apply_voucher"
+  | "product_reco"
+  | "ticket"
+  | "checkout";
+
+interface RequestBody {
+  message?: string;
+  session_id?: string;
+  user_id?: string;
+  user_email?: string;
+  timestamp?: string;
+  source?: string;
+}
+
+// Product catalog imports
+const PRODUCTS = CAT_PRODUCTS;
+
+const VOUCHERS = [
+  { code: "WELCOME10", type: "percent" as const, value: 10, min_subtotal_cents: 0, applies_to: "*" },
+  { code: "CERAMIDE15", type: "percent" as const, value: 15, min_subtotal_cents: 2000, applies_to: "ceramide" },
+];
+
+export type CartLine = { product_name: string; qty: number; unit_price_cents: number; image_url?: string };
+export type Cart = { items: CartLine[]; subtotal_cents: number; discount_cents: number; total_cents: number; voucher_code?: string | null };
+
+// Ephemeral in-memory carts keyed by session_id (replace with DB in production)
+const carts = new Map<string, Cart>();
+const lastHit = new Map<string, number>();
+const awaitingClarification = new Map<string, boolean>();
+
+const currency = (cents: number) => `$${(cents / 100).toFixed(2)}`;
+
+export function findProductByQuery(q: string | undefined) {
+  if (!q) return undefined;
+  const results = searchProducts(q, 5);
+  return results[0];
+}
+
+export function ensureCart(sessionId: string): Cart {
+  let cart = carts.get(sessionId);
+  if (!cart) {
+    cart = { items: [], subtotal_cents: 0, discount_cents: 0, total_cents: 0, voucher_code: null };
+    carts.set(sessionId, cart);
+  }
+  return cart;
+}
+
+export function recomputeTotals(cart: Cart) {
+  cart.subtotal_cents = cart.items.reduce((acc, l) => acc + l.unit_price_cents * l.qty, 0);
+  // Re-apply voucher if any
+  const discount = computeBestVoucher(cart, cart.voucher_code || undefined);
+  cart.discount_cents = discount.amount_cents;
+  cart.total_cents = Math.max(0, cart.subtotal_cents - cart.discount_cents);
+}
+
+export function computeBestVoucher(cart: Cart, preferred?: string) {
+  const candidates = VOUCHERS.filter((v) => v.code === preferred || !preferred);
+  const eligible = (v: (typeof VOUCHERS)[number]) => {
+    if (cart.subtotal_cents < v.min_subtotal_cents) return false;
+    if (v.applies_to === "*") return true;
+    const hasTag = cart.items.some((l) => {
+      const prod = PRODUCTS.find((p) => p.name === l.product_name);
+      return prod?.tags?.includes(v.applies_to as string);
+    });
+    return hasTag;
+  };
+  let best = { code: preferred || null as string | null, amount_cents: 0 };
+  const pool = preferred ? VOUCHERS : VOUCHERS;
+  for (const v of pool) {
+    if (!eligible(v)) continue;
+    const amount = v.type === "percent" ? Math.floor((cart.subtotal_cents * v.value) / 100) : v.value;
+    if (amount > best.amount_cents) best = { code: v.code, amount_cents: amount };
+  }
+  return best;
+}
+
+export function extractQty(text: string) {
+  const m = text.match(/\b(\d{1,2})\b/);
+  return m ? Math.max(1, parseInt(m[1], 10)) : 1;
+}
+
+export function detectIntent(text: string): Intent {
+  const t = text.toLowerCase();
+  const voucherKeywords = ["voucher","discount","promo","coupon","code","deal","eligible","diskon","kupon","kode","potongan","ada promo","ada diskon"];
+  if (voucherKeywords.some((k) => t.includes(k))) return "apply_voucher";
+  if (isOutOfScope(t)) return "ticket";
+  if (/\b(add|tambah|buy|beli|masukkan)\b/.test(t)) return "add_line";
+  if (/\b(edit|update|ubah)\b/.test(t)) return "edit_line";
+  if (/\b(remove|hapus|delete)\b/.test(t)) return "delete_line";
+  if (/\b(clear cart|delete cart|empty cart)\b/.test(t)) return "delete_cart";
+  if (/\b(cart|keranjang|show my cart)\b/.test(t)) return "get_cart_info";
+  if (/\b(ticket|help|human|cs)\b/.test(t)) return "ticket";
+  if (/\b(checkout|buy now|ready to buy|pay|checkout link)\b/.test(t)) return "checkout";
+  return "product_reco";
+}
+
+function isOutOfScope(t: string) {
+  const triggers = [
+    "track", "where is my order", "resi", "awb", "delivery", "courier", "arrived",
+    "refund", "exchange", "warranty", "policy", "defect", "broken", "double charge",
+    "stock", "availability", "ready stock", "in stock",
+    "change address", "after checkout",
+  ];
+  return triggers.some((k) => t.includes(k));
+}
+
+// Optional Supabase server client (service role) for persistence
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const hasSupabase = Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
+const supabaseSrv = hasSupabase ? createClient<Database>(SUPABASE_URL as string, SUPABASE_SERVICE_ROLE_KEY as string) : null;
+
+async function saveMessage(sessionId: string, role: "user" | "assistant", content: string) {
+  if (!supabaseSrv) return;
+  try {
+    await supabaseSrv.from("chat_messages").insert({ session_id: sessionId, role, content });
+  } catch {}
+}
+
+async function loadRecentMessages(sessionId: string, limit = 12) {
+  if (!supabaseSrv) return [] as Array<{ role: string; content: string; created_at: string }>;
+  try {
+    const { data } = await supabaseSrv
+      .from("chat_messages")
+      .select("role, content, created_at")
+      .eq("session_id", sessionId)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+    return (data || []).reverse();
+  } catch {
+    return [];
+  }
+}
+
+async function createTicket(sessionId: string, user_email: string | undefined, subject: string, message: string, category?: string, priority?: string) {
+  if (!supabaseSrv) return { ticket_id: crypto.randomUUID() };
+  try {
+    const { data, error } = await supabaseSrv
+      .from("tickets")
+      .insert({ session_id: sessionId, user_email, subject, message, category, priority })
+      .select("id")
+      .single();
+    if (error) throw error;
+    return { ticket_id: data.id as string };
+  } catch {
+    return { ticket_id: crypto.randomUUID() };
+  }
+}
+
+async function persistCart(sessionId: string, cart: Cart) {
+  if (!supabaseSrv) return;
+  try {
+    await supabaseSrv.from("carts").upsert({ session_id: sessionId, subtotal_cents: cart.subtotal_cents, discount_cents: cart.discount_cents, total_cents: cart.total_cents, voucher_code: cart.voucher_code });
+    // Replace cart lines
+    await supabaseSrv.from("cart_lines").delete().eq("session_id", sessionId);
+    const rows = cart.items.map((l) => ({ session_id: sessionId, product_name: l.product_name, qty: l.qty, unit_price_cents: l.unit_price_cents, image_url: l.image_url }));
+    if (rows.length) await supabaseSrv.from("cart_lines").insert(rows);
+  } catch {}
+}
+
+// Optional OpenAI intent extraction
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const CHAT_MODEL = process.env.CHAT_MODEL || "gpt-4o-mini";
+
+async function extractIntentLLM(message: string): Promise<Partial<{ intent: Intent; product_name: string; qty: number; voucher_name: string }>> {
+  if (!OPENAI_API_KEY) return {};
+  const system = `You are a router for a skincare e-commerce assistant. Output ONLY JSON with: intent (one of get_cart_info, add_line, edit_line, delete_line, delete_cart, apply_voucher, product_reco, ticket, checkout), product_name (string or empty), qty (number), voucher_name (string or empty). If user asks discounts/promos, set intent=apply_voucher.`;
+  const user = message;
+  try {
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${OPENAI_API_KEY}` },
+      body: JSON.stringify({
+        model: CHAT_MODEL,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user },
+        ],
+        temperature: 0,
+        response_format: { type: "json_object" },
+      }),
+    });
+    const data = await res.json();
+    const content = data?.choices?.[0]?.message?.content;
+    if (!content) return {};
+    const parsed = JSON.parse(content);
+    return parsed;
+  } catch {
+    return {};
+  }
+}
+
+export const handler: Handler = async (event) => {
+  if (event.httpMethod !== "POST") {
+    return { statusCode: 405, body: JSON.stringify({ error: "Method Not Allowed" }) };
+  }
+
+  // CORS preflight handled implicitly by Netlify; add headers to response
+  const headers = {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+  } as const;
+
+  try {
+    const body: RequestBody & { intent?: any; product_name?: string; qty?: number; voucher_name?: string } = event.body ? JSON.parse(event.body) : {};
+    const message = body.message?.trim() || "";
+    const sessionId = body.session_id || "anonymous";
+    // Simple per-session rate limit (1 request per 600ms)
+    const now = Date.now();
+    const last = lastHit.get(sessionId) || 0;
+    if (now - last < 600) {
+      return { statusCode: 429, headers, body: JSON.stringify({ error: "Too many requests, please slow down." }) };
+    }
+    lastHit.set(sessionId, now);
+
+
+    if (!message) {
+      return { statusCode: 400, headers, body: JSON.stringify({ error: "Missing message" }) };
+    }
+
+    // Router: LLM (optional) + keyword overrides
+    let intent: Intent | undefined;
+    let hintedProduct: string | undefined;
+    let hintedVoucher: string | undefined;
+    let hintedQty: number | undefined;
+
+    if (OPENAI_API_KEY && !body.intent) {
+      const llm = await extractIntentLLM(message);
+      if (llm.intent) intent = llm.intent;
+      hintedProduct = (llm as any).product_name || undefined;
+      hintedVoucher = (llm as any).voucher_name || undefined;
+      hintedQty = (llm as any).qty || undefined;
+    }
+
+    // Hard keyword overrides (voucher etc.)
+    intent = (body.intent as any) || intent || detectIntent(message);
+    if (body.product_name) hintedProduct = body.product_name;
+    if (typeof body.qty === 'number') hintedQty = body.qty;
+    if (typeof body.voucher_name === 'string') hintedVoucher = body.voucher_name;
+    if (intent === "product_reco") {
+      const resultsRaw = searchProducts(message, 6);
+      const results = (resultsRaw.length >= 3 ? resultsRaw : CAT_PRODUCTS).slice(0, Math.max(3, Math.min(6, resultsRaw.length || 3)));
+      const output = results.length > 0
+        ? `Here are some recommendations to consider for your routine:`
+        : `I couldn’t find an exact match, but here are some popular options:`;
+      await saveMessage(sessionId, "user", message);
+      await saveMessage(sessionId, "assistant", output);
+      return { statusCode: 200, headers, body: JSON.stringify({ output, products: results }) };
+    }
+
+  const cart = ensureCart(sessionId);
+  // Attempt to ensure a persistent cart via Supabase RPC if available
+  try {
+    if (supabaseSrv) {
+      const { data: ensured } = await supabaseSrv.rpc('ensure_cart', { p_currency: 'USD', p_session_id: sessionId, p_user_id: body.user_id || null });
+      if (ensured?.id) {
+        cart.voucher_code = cart.voucher_code || null;
+      }
+    }
+  } catch {}
+
+    if (intent === "get_cart_info") {
+      recomputeTotals(cart);
+      const output = `Your cart summary — Subtotal ${currency(cart.subtotal_cents)}, Discount -${currency(cart.discount_cents)}, Total ${currency(cart.total_cents)}.`;
+      await persistCart(sessionId, cart);
+      await saveMessage(sessionId, "user", message);
+      await saveMessage(sessionId, "assistant", output);
+      return { statusCode: 200, headers, body: JSON.stringify({ output, cart }) };
+    }
+
+    if (intent === "delete_cart") {
+      carts.set(sessionId, { items: [], subtotal_cents: 0, discount_cents: 0, total_cents: 0, voucher_code: null });
+      const fresh = ensureCart(sessionId);
+      const output = `Cart cleared.`;
+      await persistCart(sessionId, fresh);
+      await saveMessage(sessionId, "user", message);
+      await saveMessage(sessionId, "assistant", output);
+      return { statusCode: 200, headers, body: JSON.stringify({ output, cart: fresh }) };
+    }
+
+    if (intent === "add_line" || intent === "edit_line" || intent === "delete_line") {
+      const searchQ = hintedProduct || message;
+      const matches = searchProducts(searchQ, 5);
+      if (matches.length === 0) {
+        return { statusCode: 200, headers, body: JSON.stringify({ output: "I couldn’t find that product. Could you specify the name?" }) };
+      }
+      if (matches.length > 1) {
+        if (awaitingClarification.get(sessionId)) {
+          // escalate to ticket per one-clarification rule
+          const { ticket_id } = await createTicket(sessionId, body.user_email, "Product clarification needed", `User message: ${message}`, "product_info", "normal");
+          const short = ticket_id.replace(/-/g, "").toUpperCase().slice(0, 8);
+          const output = `I’ve opened ticket #${short} so our skincare team can help you choose the exact product. If you’d like updates by email, please share it here.`;
+          awaitingClarification.delete(sessionId);
+          await saveMessage(sessionId, "assistant", output);
+          return { statusCode: 200, headers, body: JSON.stringify({ output, ticket_id }) };
+        }
+        awaitingClarification.set(sessionId, true);
+        const names = matches.slice(0, 3).map((p) => p.name).join(" or ");
+        const output = `Did you mean ${names}?`;
+        return { statusCode: 200, headers, body: JSON.stringify({ output }) };
+      }
+      awaitingClarification.delete(sessionId);
+      const product = matches[0];
+      const qty = hintedQty || extractQty(message);
+      const idx = cart.items.findIndex((l) => l.product_name === product.name);
+      if (intent === "add_line") {
+        if (idx >= 0) cart.items[idx].qty += qty; else cart.items.push({ product_name: product.name, qty, unit_price_cents: product.price_cents, image_url: product.image_url });
+      } else if (intent === "edit_line") {
+        if (idx >= 0) cart.items[idx].qty = qty; else cart.items.push({ product_name: product.name, qty, unit_price_cents: product.price_cents, image_url: product.image_url });
+      } else if (intent === "delete_line") {
+        if (idx >= 0) cart.items.splice(idx, 1);
+      }
+      recomputeTotals(cart);
+      // Persist to Supabase using RPCs when available
+      try {
+        if (supabaseSrv) {
+          const { data: ensured } = await supabaseSrv.rpc('ensure_cart', { p_currency: 'USD', p_session_id: sessionId, p_user_id: body.user_id || null });
+          if (ensured?.id) {
+            if (intent === 'add_line' || intent === 'edit_line') {
+              await supabaseSrv.rpc('cart_add_line', { p_cart_id: ensured.id, p_variant_gid: product.name, p_qty: qty, p_unit_price: product.price_cents, p_product_id: product.name, p_image: product.image_url || null, p_title: product.name, p_vendor: null });
+              if (intent === 'edit_line') {
+                await supabaseSrv.rpc('cart_set_qty', { p_cart_id: ensured.id, p_qty: qty, p_variant_gid: product.name });
+              }
+            } else if (intent === 'delete_line') {
+              await supabaseSrv.rpc('cart_remove_line', { p_cart_id: ensured.id, p_variant_gid: product.name });
+            }
+          }
+        }
+      } catch {}
+      const output = `${intent === "delete_line" ? "Removed" : "Updated"} ${product.name}. New total ${currency(cart.total_cents)}.`;
+      await persistCart(sessionId, cart);
+      await saveMessage(sessionId, "user", message);
+      await saveMessage(sessionId, "assistant", output);
+      return { statusCode: 200, headers, body: JSON.stringify({ output, cart }) };
+    }
+
+    if (intent === "apply_voucher") {
+      // If message contains an explicit code, try it; else best eligible
+      const codeMatch = (hintedVoucher || message).match(/[A-Z0-9]{4,}/i);
+      recomputeTotals(cart);
+      let best = computeBestVoucher(cart, codeMatch ? codeMatch[0].toUpperCase() : undefined);
+      if (codeMatch && best.code?.toUpperCase() !== codeMatch[0].toUpperCase()) {
+        // provided code invalid → retry best-eligible without code
+        best = computeBestVoucher(cart, undefined);
+        cart.voucher_code = best.code || null;
+        recomputeTotals(cart);
+        const output = `${codeMatch[0].toUpperCase()} isn't valid. I applied a better discount for you — new total ${currency(cart.total_cents)}.`;
+        await persistCart(sessionId, cart);
+        await saveMessage(sessionId, "user", message);
+        await saveMessage(sessionId, "assistant", output);
+        return { statusCode: 200, headers, body: JSON.stringify({ output, cart }) };
+      } else {
+        cart.voucher_code = best.code || null;
+        recomputeTotals(cart);
+        if (best.code) {
+          const saved = best.amount_cents;
+          const output = `Applied ${best.code} — you saved ${currency(saved)}! New total ${currency(cart.total_cents)}.`;
+          await persistCart(sessionId, cart);
+          await saveMessage(sessionId, "user", message);
+          await saveMessage(sessionId, "assistant", output);
+          return { statusCode: 200, headers, body: JSON.stringify({ output, cart }) };
+        } else {
+          const output = `No eligible vouchers for the current cart.`;
+          await saveMessage(sessionId, "user", message);
+          await saveMessage(sessionId, "assistant", output);
+          return { statusCode: 200, headers, body: JSON.stringify({ output, cart }) };
+        }
+      }
+    }
+
+    if (intent === "checkout") {
+      recomputeTotals(cart);
+      const params = new URLSearchParams();
+      cart.items.forEach((l, i) => {
+        params.append(`item${i}_name`, l.product_name);
+        params.append(`item${i}_qty`, String(l.qty));
+      });
+      if (cart.voucher_code) params.append("voucher", cart.voucher_code);
+      const base = process.env.CHECKOUT_BASE_URL || "https://example-checkout.local/checkout";
+      const checkoutUrl = `${base}?${params.toString()}`;
+      const output = `Here’s your checkout link: ${checkoutUrl}`;
+      await saveMessage(sessionId, "user", message || "checkout");
+      await saveMessage(sessionId, "assistant", output);
+      return { statusCode: 200, headers, body: JSON.stringify({ output, cart, checkout_url: checkoutUrl }) };
+    }
+
+    if (intent === "ticket") {
+      const { ticket_id } = await createTicket(sessionId, body.user_email, "Support request", message, undefined, undefined);
+      const output = `All set — I’ve opened ticket #${ticket_id.replace(/-/g, "").toUpperCase().slice(0, 8)} for your request.`;
+      await saveMessage(sessionId, "user", message);
+      await saveMessage(sessionId, "assistant", output);
+      return { statusCode: 200, headers, body: JSON.stringify({ output, ticket_id }) };
+    }
+
+    // Fallback
+    return { statusCode: 200, headers, body: JSON.stringify({ output: "How can I help you with Skintific products, cart, or vouchers today?" }) };
+  } catch (err) {
+    console.error(err);
+    return { statusCode: 500, body: JSON.stringify({ error: "Internal Server Error" }) };
+  }
+};
+
+export default handler;
+
+
