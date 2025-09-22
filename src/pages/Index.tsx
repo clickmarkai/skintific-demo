@@ -2,6 +2,7 @@ import HeroSection from "@/components/HeroSection";
 import ProductGrid from "@/components/ProductGrid";
 import SkincareSections from "@/components/SkincareSections";
 import ChatWidget from "@/components/ChatWidget";
+import Footer from "@/sections/SiteFooter";
 
 const Index = () => {
   return (
@@ -10,6 +11,7 @@ const Index = () => {
       <ProductGrid />
       <SkincareSections />
       <ChatWidget />
+      <Footer />
     </div>
   );
 };
