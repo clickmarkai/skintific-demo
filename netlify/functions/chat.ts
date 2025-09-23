@@ -131,19 +131,32 @@ const supabaseSrv = hasSupabase ? createClient<Database>(VITE_SUPABASE_URL as st
 async function saveMessage(sessionId: string, role: "user" | "assistant", content: string) {
   if (!supabaseSrv) return;
   try {
-    await supabaseSrv.from("chat_messages").insert({ session_id: sessionId, role, content });
+    // Back-compat table
+    await (supabaseSrv as any).from("chat_messages").insert({ session_id: sessionId, role, content });
+    // Primary history table for n8n (expects message JSON)
+    await (supabaseSrv as any).from("n8n_chat_histories").insert({ session_id: sessionId, message: { role, content } });
   } catch {}
 }
 
 async function loadRecentMessages(sessionId: string, limit = 12) {
   if (!supabaseSrv) return [] as Array<{ role: string; content: string; created_at: string }>;
   try {
-    const { data } = await supabaseSrv
-      .from("chat_messages")
+    // Prefer n8n_chat_histories if exists; fallback to chat_messages
+    let { data, error } = await supabaseSrv
+      .from("n8n_chat_histories")
       .select("role, content, created_at")
       .eq("session_id", sessionId)
       .order("created_at", { ascending: false })
       .limit(limit);
+    if (error) {
+      const alt = await supabaseSrv
+        .from("chat_messages")
+        .select("role, content, created_at")
+        .eq("session_id", sessionId)
+        .order("created_at", { ascending: false })
+        .limit(limit);
+      data = alt.data as any;
+    }
     return (data || []).reverse();
   } catch {
     return [];
@@ -312,7 +325,7 @@ async function extractIntentLLM(message: string): Promise<Partial<{ intent: Inte
 
 export const handler: Handler = async (event) => {
   if (event.httpMethod !== "POST") {
-    return { statusCode: 405, body: JSON.stringify({ error: "Method Not Allowed" }) };
+    return { statusCode: 405, headers: { "Access-Control-Allow-Origin": "*" }, body: JSON.stringify({ error: "Method Not Allowed" }) };
   }
 
   // CORS preflight handled implicitly by Netlify; add headers to response
@@ -354,6 +367,22 @@ export const handler: Handler = async (event) => {
 
     // Hard keyword overrides (voucher etc.)
     intent = (body.intent as any) || intent || detectIntent(message);
+    // LLM escalation with regex fallback
+    async function classifyNeedsHumanLLM(msg: string): Promise<boolean> {
+      if (!VITE_OPENAI_API_KEY) return false;
+      try {
+        const sys = "Decide if this user request should be escalated to a human agent. Reply with pure JSON: { escalate: boolean }. Escalate if it concerns payment problems, billing, refunds, duplicate charges, missing confirmations/emails, account security, or anything requiring manual intervention beyond product recommendations, vouchers, cart or pricing.";
+        const res = await fetch("https://api.openai.com/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${VITE_OPENAI_API_KEY}` }, body: JSON.stringify({ model: CHAT_MODEL, messages: [{ role: "system", content: sys }, { role: "user", content: msg }], temperature: 0, response_format: { type: "json_object" } }) });
+        const data = await res.json();
+        const parsed = JSON.parse(data?.choices?.[0]?.message?.content || "{}");
+        return Boolean(parsed.escalate);
+      } catch { return false; }
+    }
+    const regexNeedsHuman = /\b(payment|paid|charge|charged|billing|invoice|receipt|no\s*email|email\s*confirm|confirmation|failed\s*payment|refund|chargeback|double\s*charge)\b/i.test(message);
+    let needsHuman = regexNeedsHuman || await classifyNeedsHumanLLM(message);
+    if (needsHuman && intent !== 'apply_voucher' && intent !== 'get_cart_info') {
+      intent = 'ticket';
+    }
     if (body.product_name) hintedProduct = body.product_name;
     if (typeof body.qty === 'number') hintedQty = body.qty;
     if (typeof body.voucher_name === 'string') hintedVoucher = body.voucher_name;
@@ -613,11 +642,46 @@ export const handler: Handler = async (event) => {
     }
 
     if (intent === "ticket") {
-      const { ticket_id } = await createTicket(sessionId, body.user_email, "Support request", message, undefined, undefined);
-      const output = `All set — I’ve opened ticket #${ticket_id.replace(/-/g, "").toUpperCase().slice(0, 8)} for your request.`;
+      // Create a ticket via webhook for OOS topics
+      const webhookUrl = process.env.TICKET_WEBHOOK_URL || "https://primary-production-b68a.up.railway.app/webhook/ticket_create";
+      // Try to infer subject/category with LLM, fallback to heuristics
+      let subject = "Customer support request";
+      let category = "general";
+      if (VITE_OPENAI_API_KEY) {
+        try {
+          const sys = `Extract concise subject and category for a customer support ticket from the user's last message. Return JSON {subject:string, category:string}. Categories: product_info, order, payment, shipping, return_refund, account, other.`;
+          const res = await fetch("https://api.openai.com/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${VITE_OPENAI_API_KEY}` }, body: JSON.stringify({ model: CHAT_MODEL, messages: [{ role: "system", content: sys }, { role: "user", content: message }], temperature: 0, response_format: { type: "json_object" } }) });
+          const data = await res.json();
+          const parsed = JSON.parse(data?.choices?.[0]?.message?.content || "{}");
+          subject = typeof parsed.subject === 'string' && parsed.subject.trim() ? parsed.subject.trim() : subject;
+          category = typeof parsed.category === 'string' && parsed.category.trim() ? parsed.category.trim() : category;
+        } catch {}
+      } else {
+        const lower = (message || '').toLowerCase();
+        if (/stock|availability|ready/.test(lower)) category = 'product_info';
+        else if (/refund|return/.test(lower)) category = 'return_refund';
+        else if (/ship|delivery|courier/.test(lower)) category = 'shipping';
+        else if (/pay|payment|charge/.test(lower)) category = 'payment';
+        subject = message.slice(0, 80) || subject;
+      }
+      const payload = [{
+        user_email: body.user_email || 'anonymous@example.com',
+        message,
+        category,
+        session_id: sessionId,
+        user_Id: body.user_id || 'anonymous',
+        subject
+      }];
+      try {
+        const r = await fetch(webhookUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+        if (!r.ok) {
+          console.error('Ticket webhook failed', r.status, await r.text().catch(()=>'') );
+        }
+      } catch (e) { console.error('Ticket webhook error', e); }
+      const output = `I’ve created a support ticket so a human can assist you shortly. Subject: ${subject}.`;
       await saveMessage(sessionId, "user", message);
       await saveMessage(sessionId, "assistant", output);
-      return { statusCode: 200, headers, body: JSON.stringify({ output, ticket_id }) };
+      return { statusCode: 200, headers, body: JSON.stringify({ output, ticket_created: true }) };
     }
 
     // Fallback

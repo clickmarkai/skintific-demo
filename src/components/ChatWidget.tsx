@@ -63,8 +63,15 @@ const ChatWidget = () => {
     try { return localStorage.getItem('chat_open') === '1'; } catch { return false; }
   });
   const [sessionId] = useState(() => {
-    // Start a fresh ephemeral session on each page load
-    return crypto.randomUUID();
+    try {
+      const existing = localStorage.getItem('chat_session_id');
+      if (existing) return existing;
+      const fresh = crypto.randomUUID();
+      localStorage.setItem('chat_session_id', fresh);
+      return fresh;
+    } catch {
+      return crypto.randomUUID();
+    }
   });
   const [isMinimized, setIsMinimized] = useState(() => {
     try { return localStorage.getItem('chat_min') === '1'; } catch { return false; }
@@ -148,8 +155,83 @@ const ChatWidget = () => {
     return sessionId;
   };
 
-  // Do not auto-load past conversation on refresh; start fresh like a new chat
-  useEffect(() => { setHistoryLoaded(true); }, []);
+  // Load persisted history from Supabase (n8n_chat_histories)
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        if (!supabase) { setHistoryLoaded(true); return; }
+        const { data } = await (supabase as any)
+          .from('n8n_chat_histories')
+          .select('id, message')
+          .eq('session_id', sessionId)
+          .order('id', { ascending: true })
+          .limit(200);
+        const initialGreeting = "Hello! How can I help you today?";
+        if (!cancelled && Array.isArray(data) && data.length) {
+          const restored: Message[] = data.map((row: any, idx: number) => {
+            const m = (row.message || {}) as any;
+            const role = String(m.role || 'assistant');
+            const content = String(m.content || '');
+            const kind = m.kind as Message['kind'] | undefined;
+            const msg: Message = {
+              id: Number(row.id) || Date.now() + idx,
+              text: content,
+              isUser: role === 'user',
+              timestamp: new Date(),
+              kind: kind || 'text',
+            } as Message;
+            if (kind === 'products' && Array.isArray(m.products)) {
+              msg.products = m.products;
+            }
+            if (kind === 'cart' && m.cart) {
+              msg.cart = m.cart;
+            }
+            if (kind === 'vouchers' && Array.isArray(m.vouchers)) {
+              msg.vouchers = m.vouchers;
+            }
+            if (kind === 'ticket' && typeof m.ticket_id === 'string') {
+              msg.ticketId = shortId(m.ticket_id);
+            }
+            return msg;
+          });
+          const hasGreeting = restored.some((m) => !m.isUser && typeof m.text === 'string' && /hello/i.test(m.text) && /help/i.test(m.text));
+          if (!hasGreeting) {
+            restored.unshift({ id: Date.now() - 1, text: initialGreeting, isUser: false, timestamp: new Date(), kind: 'text' });
+            try { await (supabase as any).from('n8n_chat_histories').insert({ session_id: sessionId, message: { role: 'assistant', content: initialGreeting } }); } catch {}
+          }
+          setMessages(restored);
+        } else if (!cancelled) {
+          // No history — persist the greeting so it appears on future refreshes
+          try { await (supabase as any).from('n8n_chat_histories').insert({ session_id: sessionId, message: { role: 'assistant', content: initialGreeting } }); } catch {}
+        }
+      } catch {}
+      setHistoryLoaded(true);
+    })();
+    return () => { cancelled = true; };
+  }, [sessionId]);
+
+  // If history includes a cart snapshot, ensure it renders on mount
+  useEffect(() => {
+    if (!historyLoaded) return;
+    const hasCart = messages.some((m) => m.kind === 'cart');
+    if (!hasCart && supabase) {
+      (async () => {
+        try {
+          const { data } = await (supabase as any)
+            .from('n8n_chat_histories')
+            .select('id, message')
+            .eq('session_id', sessionId)
+            .order('id', { ascending: false })
+            .limit(50);
+          const cartMsg = (data || []).map((r: any) => r.message).find((m: any) => m?.kind === 'cart' && m?.cart);
+          if (cartMsg) {
+            upsertCartMessage({ text: String(cartMsg.content || 'Cart updated.'), cart: cartMsg.cart });
+          }
+        } catch {}
+      })();
+    }
+  }, [historyLoaded]);
 
   useEffect(() => {
     if (isOpen) {
@@ -193,25 +275,18 @@ const ChatWidget = () => {
 
     setMessages((prev) => [...prev, newMessage]);
     const messageText = inputValue;
+    // Persist user message
+    try {
+      if (supabase) {
+        await (supabase as any).from('n8n_chat_histories').insert({ session_id: sessionId, message: { role: 'user', content: messageText } });
+      }
+    } catch {}
     setInputValue("");
     setIsLoading(true);
 
     try {
-      // Get current session from database
-      let currentSessionId = sessionId;
-      if (user && supabase) {
-        const { data: sessionData } = await supabase
-          .from('sessions')
-          .select('id')
-          .eq('user_id', user.id)
-          .order('started_at', { ascending: false })
-          .limit(1)
-          .single();
-        
-        if (sessionData) {
-          currentSessionId = sessionData.id;
-        }
-      }
+      // Always use our stable browser conversation id
+      const currentSessionId = sessionId;
 
       let data: any;
       if (supabase) {
@@ -283,6 +358,24 @@ const ChatWidget = () => {
       }
 
       setMessages((prev) => [...prev, botResponse]);
+      // Persist assistant message with structured payload so carousels restore after refresh
+      try {
+        if (supabase) {
+          const persisted: any = { role: 'assistant', content: botResponse.text };
+          if (botResponse.kind) persisted.kind = botResponse.kind;
+          if (Array.isArray(data?.products)) persisted.products = data.products;
+          if (Array.isArray(data?.vouchers)) persisted.vouchers = data.vouchers;
+          if (data?.cart) persisted.cart = data.cart;
+          if (typeof data?.ticket_id === 'string') persisted.ticket_id = data.ticket_id;
+          await (supabase as any).from('n8n_chat_histories').insert({ session_id: sessionId, message: persisted });
+        }
+      } catch {}
+      // Persist a minimal plain text copy (optional)
+      try {
+        if (supabase) {
+          await (supabase as any).from('n8n_chat_histories').insert({ session_id: sessionId, message: { role: 'assistant', content: botResponse.text } });
+        }
+      } catch {}
     } catch (error) {
       console.error("Error sending message:", error);
       // Fallback: only show product suggestions if the user asked for products
@@ -323,7 +416,7 @@ const ChatWidget = () => {
   };
 
   // Update the most recent cart message in-place (no new chat bubble). If none exists, append one.
-  const upsertCartMessage = (payload: { text?: string; cart?: any }) => {
+  const upsertCartMessage = async (payload: { text?: string; cart?: any }) => {
     setMessages((prev) => {
       const next = [...prev];
       let idx = -1;
@@ -350,6 +443,13 @@ const ChatWidget = () => {
       };
       return [...next, newMsg];
     });
+    // Persist cart snapshot outside React state updater (no await inside setState)
+    try {
+      if (supabase) {
+        const snapshot = payload.cart;
+        await (supabase as any).from('n8n_chat_histories').insert({ session_id: sessionId, message: { role: 'assistant', content: payload.text || 'Cart updated.', kind: 'cart', cart: snapshot } });
+      }
+    } catch {}
   };
 
   const addToCart = async (
@@ -537,6 +637,7 @@ const ChatWidget = () => {
           kind: "text",
         };
         setMessages((prev) => [...prev, botResponse]);
+        try { if (supabase) { await (supabase as any).from('n8n_chat_histories').insert({ session_id: currentSessionId, message: { role: 'assistant', content: botResponse.text } }); } } catch {}
       }
     } catch (error) {
       console.error("Error adding to cart:", error);
@@ -629,6 +730,7 @@ const ChatWidget = () => {
           kind: "text",
         };
         setMessages((prev) => [...prev, botResponse]);
+        try { if (supabase) { await (supabase as any).from('n8n_chat_histories').insert({ session_id: currentSessionId, message: { role: 'assistant', content: botResponse.text } }); } } catch {}
       }
     } catch (e) {
       toast({ title: "Voucher", description: "Could not apply voucher." });
@@ -691,6 +793,7 @@ const ChatWidget = () => {
           kind: "text",
         };
         setMessages((prev) => [...prev, botResponse]);
+        try { if (supabase) { await (supabase as any).from('n8n_chat_histories').insert({ session_id: currentSessionId, role: 'assistant', content: botResponse.text }); } } catch {}
       }
     } catch (e) {
       toast({ title: "Cart", description: "Could not update quantity" });
@@ -750,6 +853,7 @@ const ChatWidget = () => {
           kind: "text",
         };
         setMessages((prev) => [...prev, botResponse]);
+        try { if (supabase) { await (supabase as any).from('n8n_chat_histories').insert({ session_id: currentSessionId, role: 'assistant', content: botResponse.text }); } } catch {}
       }
     } catch (e) {
       toast({ title: "Cart", description: "Could not remove item" });

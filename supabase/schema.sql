@@ -56,4 +56,14 @@ create table if not exists public.vouchers (
   active boolean not null default true
 );
 
+-- n8n chat history (role-based conversation log)
+create table if not exists public.n8n_chat_histories (
+  id uuid primary key default gen_random_uuid(),
+  session_id uuid not null,
+  role text not null check (role in ('user','assistant')),
+  content text not null,
+  created_at timestamptz not null default now()
+);
+create index if not exists n8n_hist_session_created_idx on public.n8n_chat_histories (session_id, created_at);
+
 

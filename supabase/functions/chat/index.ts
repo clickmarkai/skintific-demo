@@ -85,6 +85,10 @@ const logEvent = async (supabase: any, sessionId: string, userId: string | null,
       event_type: 'message',
       metadata: { role, content },
     });
+    // Persist to n8n chat history table
+    try {
+      await supabase.from('n8n_chat_histories').insert({ session_id: sessionId, message: { role, content } });
+    } catch {}
   } catch (error) {
     console.error('Error logging event:', error);
   }
@@ -105,12 +109,33 @@ serve(async (req) => {
     const body = await req.json();
     const { message = '', intent: hintedIntent, product_name: hintedProduct, qty: hintedQty } = body;
     const sessionId = body.session_id || crypto.randomUUID();
-    const intent = hintedIntent || detectIntent(message);
+    let intent = hintedIntent || detectIntent(message);
 
     const supabaseSrv = createClient(
       Deno.env.get('VITE_SUPABASE_URL')!,
       Deno.env.get('VITE_SUPABASE_SERVICE_ROLE_KEY')!
     );
+
+    // Escalate using LLM classification only (no regex gates)
+    async function classifyNeedsHumanLLM(msg: string): Promise<boolean> {
+      if (!VITE_OPENAI_API_KEY) return false;
+      try {
+        const sys = "Decide if this user request should be escalated to a human agent. Reply with pure JSON: { escalate: boolean }. Escalate if it concerns payment problems, billing, refunds, duplicate charges, missing confirmations/emails, account security, or anything requiring manual intervention beyond product recommendations, vouchers, cart or pricing.";
+        const res = await fetch('https://api.openai.com/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${VITE_OPENAI_API_KEY}` },
+          body: JSON.stringify({ model: CHAT_MODEL, messages: [{ role: 'system', content: sys }, { role: 'user', content: msg }], temperature: 0, response_format: { type: 'json_object' } })
+        });
+        const data = await res.json();
+        const parsed = JSON.parse(data?.choices?.[0]?.message?.content || '{}');
+        return Boolean(parsed.escalate);
+      } catch (_) { return false; }
+    }
+    // Escalate to ticket unless cart/voucher based solely on LLM
+    const needsHuman = await classifyNeedsHumanLLM(message);
+    if (needsHuman && intent !== 'apply_voucher' && intent !== 'get_cart_info') {
+      intent = 'ticket';
+    }
 
     if (intent === "get_cart_info") {
       try {
@@ -327,21 +352,107 @@ serve(async (req) => {
     }
 
     if (intent === "general") {
-      const output = "I can help you browse skincare products, manage your cart, or answer questions. What would you like to do?";
       await logEvent(supabaseSrv, sessionId, body.user_id, 'user', message);
-      await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', output);
-      
-      return new Response(
-        JSON.stringify({ output }),
-        { headers }
-      );
+      // Let the LLM answer with history
+      const history = await (async () => {
+        try {
+          const { data } = await (createClient(Deno.env.get('VITE_SUPABASE_URL')!, Deno.env.get('VITE_SUPABASE_SERVICE_ROLE_KEY')!))
+            .from('events').select('payload').eq('session_id', sessionId).eq('type', 'message').order('created_at', { ascending: false }).limit(16);
+          return (data || []).map((r: any) => ({ role: r.payload?.role || 'user', content: r.payload?.content || '' })).reverse();
+        } catch { return []; }
+      })();
+      let draft = "How can I help you with skincare products today?";
+      try { draft = await (async () => {
+        if (!VITE_OPENAI_API_KEY) return draft;
+        const system = { role: 'system', content: 'You are a helpful skincare shopping assistant. Keep replies concise (1-2 sentences).' } as any;
+        const bodyLLM: any = { model: CHAT_MODEL, messages: [system, ...history.slice(-10), { role: 'user', content: message }], temperature: 0.7, max_tokens: 180 };
+        const res = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Authorization': `Bearer ${VITE_OPENAI_API_KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify(bodyLLM) });
+        if (!res.ok) return draft;
+        const j = await res.json();
+        return j.choices?.[0]?.message?.content || draft;
+      })(); } catch {}
+      // Escalate based on the LLM draft only (no keywords)
+      try {
+        if (VITE_OPENAI_API_KEY) {
+          const sys = "Return JSON {\\"escalate\\": boolean}. Set escalate=true if the assistant draft does not fully answer/resolve the user's last message OR if the user explicitly requests a ticket, a human agent, or customer support contact. Otherwise escalate=false.";
+          const res = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${VITE_OPENAI_API_KEY}` }, body: JSON.stringify({ model: CHAT_MODEL, messages: [{ role: 'system', content: sys }, { role: 'user', content: `User: ${message}\nAssistantDraft: ${draft}` }], temperature: 0, response_format: { type: 'json_object' } }) });
+          const data = await res.json().catch(() => ({}));
+          const parsed = JSON.parse(data?.choices?.[0]?.message?.content || '{}');
+          if (parsed?.escalate === true) {
+            const payload = [{ user_email: body.user_email || 'anonymous@example.com', message, category: 'general', session_id: sessionId, user_Id: body.user_id || 'anonymous', subject: (message || 'Customer support request').slice(0, 80) }];
+            try { const r = await fetch(Deno.env.get('TICKET_WEBHOOK_URL') || 'https://primary-production-b68a.up.railway.app/webhook/ticket_create', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }); if (!r.ok) { try { console.error('Ticket webhook failed', r.status, await r.text()); } catch {} } } catch (e) { console.error('Ticket webhook error', e); }
+            const reply = `I’ve created a support ticket so a human can assist you shortly. Subject: ${(message || 'Customer support request').slice(0, 80)}.`;
+            await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', reply);
+            return new Response(JSON.stringify({ output: reply, ticket_created: true }), { headers });
+          }
+        }
+      } catch {}
+      await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', draft);
+      return new Response(JSON.stringify({ output: draft }), { headers });
     }
 
-    // Fallback
-    return new Response(
-      JSON.stringify({ output: "How can I help you with skincare products today?" }),
-      { headers }
-    );
+    if (intent === "ticket") {
+      const webhookUrl = Deno.env.get('TICKET_WEBHOOK_URL') || 'https://primary-production-b68a.up.railway.app/webhook/ticket_create';
+      let subject = 'Customer support request';
+      let category = 'general';
+      if (VITE_OPENAI_API_KEY) {
+        try {
+          const sys = `Extract concise subject and category for a customer support ticket from the user's last message. Return JSON {subject:string, category:string}. Categories: product_info, order, payment, shipping, return_refund, account, other.`;
+          const res = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${VITE_OPENAI_API_KEY}` }, body: JSON.stringify({ model: CHAT_MODEL, messages: [{ role: 'system', content: sys }, { role: 'user', content: message }], temperature: 0, response_format: { type: 'json_object' } }) });
+          const data = await res.json();
+          const parsed = JSON.parse(data?.choices?.[0]?.message?.content || '{}');
+          subject = typeof parsed.subject === 'string' && parsed.subject.trim() ? parsed.subject.trim() : subject;
+          category = typeof parsed.category === 'string' && parsed.category.trim() ? parsed.category.trim() : category;
+        } catch {}
+      } else {
+        const lower = (message || '').toLowerCase();
+        if (/stock|availability|ready/.test(lower)) category = 'product_info';
+        else if (/refund|return/.test(lower)) category = 'return_refund';
+        else if (/ship|delivery|courier/.test(lower)) category = 'shipping';
+        else if (/pay|payment|charge/.test(lower)) category = 'payment';
+        subject = message.slice(0, 80) || subject;
+      }
+      const payload = [{ user_email: body.user_email || 'anonymous@example.com', message, category, session_id: sessionId, user_Id: body.user_id || 'anonymous', subject }];
+      try { 
+        const r = await fetch(webhookUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }); 
+        if (!r.ok) { console.error('Ticket webhook failed', r.status, await r.text().catch(()=>'')); }
+      } catch (e) { console.error('Ticket webhook error', e); }
+      const output = `I’ve created a support ticket so a human can assist you shortly. Subject: ${subject}.`;
+      await logEvent(supabaseSrv, sessionId, body.user_id, 'user', message);
+      await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', output);
+      return new Response(JSON.stringify({ output, ticket_created: true }), { headers });
+    }
+
+    // Fallback with LLM-based draft and escalation
+    let fallbackDraft = "How can I help you with skincare products today?";
+    try {
+      if (VITE_OPENAI_API_KEY) {
+        const history = await (async () => {
+          try {
+            const { data } = await (createClient(Deno.env.get('VITE_SUPABASE_URL')!, Deno.env.get('VITE_SUPABASE_SERVICE_ROLE_KEY')!))
+              .from('events').select('payload').eq('session_id', sessionId).eq('type', 'message').order('created_at', { ascending: false }).limit(16);
+            return (data || []).map((r: any) => ({ role: r.payload?.role || 'user', content: r.payload?.content || '' })).reverse();
+          } catch { return []; }
+        })();
+        const system = { role: 'system', content: 'You are a helpful skincare shopping assistant. Keep replies concise (1-2 sentences).' } as any;
+        const bodyLLM: any = { model: CHAT_MODEL, messages: [system, ...history.slice(-10), { role: 'user', content: message }], temperature: 0.7, max_tokens: 180 };
+        const res = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Authorization': `Bearer ${VITE_OPENAI_API_KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify(bodyLLM) });
+        if (res.ok) { const j = await res.json(); fallbackDraft = j.choices?.[0]?.message?.content || fallbackDraft; }
+        const sys = "Return JSON {\\"escalate\\": boolean}. Set escalate=true if the assistant draft does not fully answer/resolve the user's last message OR if the user explicitly requests a ticket, a human agent, or customer support contact. Otherwise escalate=false.";
+        const res2 = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${VITE_OPENAI_API_KEY}` }, body: JSON.stringify({ model: CHAT_MODEL, messages: [{ role: 'system', content: sys }, { role: 'user', content: `User: ${message}\nAssistantDraft: ${fallbackDraft}` }], temperature: 0, response_format: { type: 'json_object' } }) });
+        const data2 = await res2.json().catch(() => ({}));
+        const parsed2 = JSON.parse(data2?.choices?.[0]?.message?.content || '{}');
+        if (parsed2?.escalate === true) {
+          const payload = [{ user_email: body.user_email || 'anonymous@example.com', message, category: 'general', session_id: sessionId, user_Id: body.user_id || 'anonymous', subject: (message || 'Customer support request').slice(0, 80) }];
+          try { const r = await fetch(Deno.env.get('TICKET_WEBHOOK_URL') || 'https://primary-production-b68a.up.railway.app/webhook/ticket_create', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }); if (!r.ok) { try { console.error('Ticket webhook failed', r.status, await r.text()); } catch {} } } catch (e) { console.error('Ticket webhook error', e); }
+          const reply = `I’ve created a support ticket so a human can assist you shortly. Subject: ${(message || 'Customer support request').slice(0, 80)}.`;
+          await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', reply);
+          return new Response(JSON.stringify({ output: reply, ticket_created: true }), { headers });
+        }
+      }
+    } catch {}
+    await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', fallbackDraft);
+    return new Response(JSON.stringify({ output: fallbackDraft }), { headers });
   } catch (err) {
     console.error('Server error:', err);
     return new Response(
