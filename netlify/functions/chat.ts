@@ -199,7 +199,7 @@ function normalizeQuery(input: string) {
 }
 
 async function searchProductsFromDB(query: string, limit = 6) {
-  if (!supabaseSrv) return [] as Array<{ id: string; name: string; price?: number; image_url?: string; tags?: string[]; variant_id?: string }>;
+  if (!supabaseSrv) return [] as Array<{ id: string; name: string; price?: number; image_url?: string; tags?: string[]; variant_id?: string; description?: string }>;
   const { root, terms } = normalizeQuery(query);
   // Prefer semantic search via RPC if available, else fallback to keyword search
   try {
@@ -235,6 +235,7 @@ async function searchProductsFromDB(query: string, limit = 6) {
                   image_url: (md.image_url as string) || firstImage,
                   tags: (md.tags as string[]) || [],
                   variant_id: (row.variant_id as string) || undefined,
+                  description: (md.description as string) || (row.content as string)?.slice(0, 160),
                 };
               });
               return mapped;
@@ -272,11 +273,12 @@ async function searchProductsFromDB(query: string, limit = 6) {
         image_url: (md.image_url as string) || firstImage,
         tags: (md.tags as string[]) || [],
         variant_id: (row.variant_id as string) || undefined,
+        description: (md.description as string) || (row.content as string)?.slice(0, 160),
       };
     });
     return mapped;
   } catch {
-    return [] as Array<{ id: string; name: string; price?: number; image_url?: string; tags?: string[]; variant_id?: string }>;
+    return [] as Array<{ id: string; name: string; price?: number; image_url?: string; tags?: string[]; variant_id?: string; description?: string }>;
   }
 }
 
@@ -365,11 +367,18 @@ export const handler: Handler = async (event) => {
         image_url: p.image_url,
         tags: p.tags,
         variant_id: p.variant_id,
+        description: undefined,
       }));
       if (!results.length) {
         // Fallback to in-memory demo catalog
         const demo = searchProducts(message, 6);
-        results = demo.map((d) => ({ name: d.name, price_cents: d.price_cents, image_url: d.image_url, tags: d.tags }));
+        results = demo.map((d) => ({ 
+          name: d.name, 
+          price_cents: d.price_cents, 
+          image_url: d.image_url, 
+          tags: d.tags,
+          description: `Top pick: ${d.name}. Loved for ${Array.isArray(d.tags) && d.tags.length ? d.tags.slice(0,2).join(", ") : 'great results'}.`
+        }));
       }
       const output = results.length > 0
         ? `Here are some recommendations to consider for your routine:`

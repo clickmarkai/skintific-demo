@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { MessageCircle, Send, X, Minimize2 } from "lucide-react";
+import { MessageCircle, Send, X, Minimize2, ChevronLeft, ChevronRight } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import TypingIndicator from "@/components/TypingIndicator";
 import ReactMarkdown from 'react-markdown';
@@ -29,6 +29,7 @@ interface Message {
     benefits?: string[];
     ingredients?: string[];
     tags?: string[];
+    description?: string;
   }>;
   cart?: {
     items: Array<{
@@ -82,6 +83,14 @@ const ChatWidget = () => {
   const { user } = useAuth();
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const productScrollRefs = useRef<Record<number, HTMLDivElement | null>>({});
+
+  const scrollProducts = (id: number, direction: "left" | "right") => {
+    const container = productScrollRefs.current[id];
+    if (!container) return;
+    const delta = Math.max(240, Math.floor(container.clientWidth * 0.9));
+    container.scrollBy({ left: direction === "left" ? -delta : delta, behavior: "smooth" });
+  };
 
   // NEW: animation mount + phase
   const [mounted, setMounted] = useState(false);
@@ -422,13 +431,13 @@ const ChatWidget = () => {
               cartId = (ensured as any).id as string;
             }
           }
-          const variantId = variantId ?? productId ?? productName;
+          const resolvedVariantId = variantId ?? productId ?? productName;
           // Check if line exists
           const { data: existing } = await (supabase as any)
             .from('cart_products')
             .select('id, qty')
             .eq('cart_id', cartId)
-            .or(`variant_id.eq.${variantId},product_id.eq.${productId},title_snapshot.eq.${productName}`)
+            .or(`variant_id.eq.${resolvedVariantId},product_id.eq.${productId},title_snapshot.eq.${productName}`)
             .order('updated_at', { ascending: false })
             .limit(1);
           const row = (existing || [])[0] || null;
@@ -440,7 +449,7 @@ const ChatWidget = () => {
                 title_snapshot: productName,
                 unit_price: (unitPriceCents || 0) / 100,
                 image_url: imageUrl || null,
-                variant_id: variantId,
+                variant_id: resolvedVariantId,
                 product_id: productId || productName,
               })
               .eq('id', row.id);
@@ -450,7 +459,7 @@ const ChatWidget = () => {
               .insert({
                 cart_id: cartId,
                 product_id: productId || productName,
-                variant_id: variantId,
+                variant_id: resolvedVariantId,
                 qty: Math.max(1, qty || 1),
                 unit_price: (unitPriceCents || 0) / 100,
                 title_snapshot: productName,
@@ -869,36 +878,43 @@ const ChatWidget = () => {
 
                             {/* Rich content renderers */}
                             {message.kind === "products" && message.products && (
-                              <div className="mt-3 -mx-2">
-                                <div className="flex gap-3 overflow-x-auto px-2 pb-2 snap-x snap-mandatory">
+                              <div className="relative mt-3 -mx-2">
+                                <div
+                                  ref={(el) => { productScrollRefs.current[message.id] = el; }}
+                                  className="flex gap-3 overflow-x-auto px-2 pb-2 snap-x snap-mandatory no-scrollbar"
+                                >
                                   {message.products.map((p, idx) => (
-                                    <div key={idx} className="flex-none w-[240px] snap-start p-3 border rounded-lg bg-white">
-                                      <div className="flex gap-3 items-start">
+                                    <div key={idx} className="flex-none w-[260px] snap-start p-3 border rounded-lg bg-white">
+                                      <div className="space-y-2">
                                         {p.image_url && (
                                           <img
                                             src={p.image_url}
                                             alt={p.name}
-                                            className="w-16 h-16 rounded object-cover border"
+                                            className="w-full h-36 rounded object-cover border"
                                             loading="lazy"
                                             onError={(e) => { (e.currentTarget as HTMLImageElement).src = '/placeholder.svg'; }}
                                           />
                                         )}
-                                        <div className="flex-1">
-                                          <div className="font-semibold leading-tight line-clamp-2">{p.name}</div>
-                                          <div className="text-xs text-gray-600">{p.price_cents != null ? formatCurrency(p.price_cents) : (p.price != null ? `$${p.price.toFixed(2)}` : "")}</div>
-                                          {p.tags && p.tags.length > 0 && (
-                                            <div className="mt-1 flex flex-wrap gap-1">
-                                              {p.tags.slice(0, 3).map((t, i) => (
-                                                <span key={i} className="px-2 py-0.5 rounded-full bg-gray-200 text-gray-700 text-[10px]">{t}</span>
-                                              ))}
-                                            </div>
+                                        <div className="font-semibold leading-tight line-clamp-2">{p.name}</div>
+                                        <div className="text-xs text-gray-600">{p.price_cents != null ? formatCurrency(p.price_cents) : (p.price != null ? `$${p.price.toFixed(2)}` : "")}</div>
+                                        {p.tags && p.tags.length > 0 && (
+                                          <div className="mt-1 flex flex-wrap gap-1">
+                                            {p.tags.slice(0, 3).map((t, i) => (
+                                              <span key={i} className="px-2 py-0.5 rounded-full bg-gray-200 text-gray-700 text-[10px]">{t}</span>
+                                            ))}
+                                          </div>
+                                        )}
+                                      </div>
+                                      {(p.description || (p.benefits && p.benefits.length > 0)) && (
+                                        <div className="mt-2 text-xs text-gray-700">
+                                          {p.description ? (
+                                            <p className="line-clamp-3">{p.description}</p>
+                                          ) : (
+                                            <ul className="list-disc ml-4">
+                                              {p.benefits!.slice(0, 3).map((b, i) => (<li key={i}>{b}</li>))}
+                                            </ul>
                                           )}
                                         </div>
-                                      </div>
-                                      {(p.benefits && p.benefits.length > 0) && (
-                                        <ul className="mt-2 text-xs list-disc ml-4">
-                                          {p.benefits.slice(0, 3).map((b, i) => (<li key={i}>{b}</li>))}
-                                        </ul>
                                       )}
                                       {p.images && p.images.length > 1 && (
                                         <div className="mt-2 flex gap-2 overflow-x-auto">
@@ -922,6 +938,24 @@ const ChatWidget = () => {
                                     </div>
                                   ))}
                                 </div>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="absolute left-1 top-1/2 -translate-y-1/2 h-7 w-7 rounded-full bg-white/90 shadow"
+                                  aria-label="Scroll left"
+                                  onClick={() => scrollProducts(message.id, "left")}
+                                >
+                                  <ChevronLeft className="h-4 w-4" />
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="absolute right-1 top-1/2 -translate-y-1/2 h-7 w-7 rounded-full bg-white/90 shadow"
+                                  aria-label="Scroll right"
+                                  onClick={() => scrollProducts(message.id, "right")}
+                                >
+                                  <ChevronRight className="h-4 w-4" />
+                                </Button>
                               </div>
                             )}
 
