@@ -36,4 +36,20 @@ describe('cart totals and vouchers', () => {
   })
 })
 
+describe('cart add/edit flow (unit)', () => {
+  it('adds a line and updates totals', () => {
+    const cart: Cart = ensureCart('test-session')
+    cart.items.length = 0
+    cart.voucher_code = null
+    cart.items.push({ product_name: 'Aqua Light Daily Sunscreen SPF 35+ PA+++', qty: 1, unit_price_cents: 1199 })
+    recomputeTotals(cart)
+    expect(cart.subtotal_cents).toBe(1199)
+    expect(cart.total_cents).toBe(1199)
+    // edit qty
+    cart.items[0].qty = 2
+    recomputeTotals(cart)
+    expect(cart.total_cents).toBe(1199 * 2)
+  })
+})
+
 

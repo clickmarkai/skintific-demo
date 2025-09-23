@@ -11,6 +11,9 @@ export default function CartPage() {
   const [lines, setLines] = useState<Line[]>([])
   const [loading, setLoading] = useState(true)
   const [subtotal, setSubtotal] = useState(0)
+  const [discount, setDiscount] = useState(0)
+  const [total, setTotal] = useState(0)
+  const [voucher, setVoucher] = useState<string | null>(null)
   const { user } = useAuth()
   const [method, setMethod] = useState<'bank'|'card'|'qris'>('bank')
 
@@ -60,6 +63,9 @@ export default function CartPage() {
       const items = (data?.cart?.items || []) as any[]
       setLines(items.map(it => ({ product_name: it.product_name, qty: it.qty || 0, unit_price_cents: it.unit_price_cents || 0, image_url: it.image_url, product_id: it.product_id, variant_id: it.variant_id })))
       setSubtotal((data?.cart?.subtotal_cents || 0))
+      setDiscount((data?.cart?.discount_cents || 0))
+      setTotal((data?.cart?.total_cents ?? data?.cart?.subtotal_cents) || 0)
+      setVoucher((data?.cart?.voucher_code || null))
     } catch {}
     setLoading(false)
   }
@@ -72,6 +78,9 @@ export default function CartPage() {
     const items = (data?.cart?.items || []) as any[]
     setLines(items.map(it => ({ product_name: it.product_name, qty: it.qty || 0, unit_price_cents: it.unit_price_cents || 0, image_url: it.image_url, product_id: it.product_id, variant_id: it.variant_id })))
     setSubtotal((data?.cart?.subtotal_cents || 0))
+    setDiscount((data?.cart?.discount_cents || 0))
+    setTotal((data?.cart?.total_cents ?? data?.cart?.subtotal_cents) || 0)
+    setVoucher((data?.cart?.voucher_code || null))
   }
 
   const removeLine = async (line: Line) => {
@@ -80,6 +89,9 @@ export default function CartPage() {
     const items = (data?.cart?.items || []) as any[]
     setLines(items.map(it => ({ product_name: it.product_name, qty: it.qty || 0, unit_price_cents: it.unit_price_cents || 0, image_url: it.image_url, product_id: it.product_id, variant_id: it.variant_id })))
     setSubtotal((data?.cart?.subtotal_cents || 0))
+    setDiscount((data?.cart?.discount_cents || 0))
+    setTotal((data?.cart?.total_cents ?? data?.cart?.subtotal_cents) || 0)
+    setVoucher((data?.cart?.voucher_code || null))
   }
 
   return (
@@ -120,7 +132,11 @@ export default function CartPage() {
 
           <div className="p-4 border rounded-lg bg-white space-y-3">
             <div className="flex justify-between"><span className="text-gray-600">Subtotal</span><span>{format(subtotal)}</span></div>
-            <div className="flex justify-between font-semibold"><span>Total</span><span>{format(subtotal)}</span></div>
+            <div className="flex justify-between"><span className="text-gray-600">Discount</span><span>-{format(discount)}</span></div>
+            <div className="flex justify-between font-semibold"><span>Total</span><span>{format(total)}</span></div>
+            {voucher ? (
+              <div className="text-sm text-green-700">Voucher applied: <strong>{voucher}</strong></div>
+            ) : null}
 
             <div>
               <div className="text-sm font-medium mb-2">Payment method</div>
@@ -152,7 +168,7 @@ export default function CartPage() {
               <Button className="bg-primary text-white" onClick={()=>{
                 if(method==='qris') {
                   const sid = localStorage.getItem('session_id') || ''
-                  const url = `/payment/qris?amount=${subtotal}&session=${encodeURIComponent(sid)}`
+                  const url = `/payment/qris?amount=${total}&session=${encodeURIComponent(sid)}`
                   window.open(url, '_blank')
                   return
                 }

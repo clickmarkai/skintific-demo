@@ -36,7 +36,7 @@ const SkincareSections = () => {
       {/* MOST LOVED IN OUR COMMUNITY */}
       <section className="py-16">
         <div className="container mx-auto px-4">
-          <h2 className="text-3xl md:text-4xl font-bold text-black mb-8 text-center">
+          <h2 className="text-2xl md:text-2xl text-black mb-8 text-center">
             MOST LOVED IN OUR COMMUNITY
           </h2>
 

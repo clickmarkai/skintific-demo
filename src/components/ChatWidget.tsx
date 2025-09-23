@@ -62,15 +62,8 @@ const ChatWidget = () => {
     try { return localStorage.getItem('chat_open') === '1'; } catch { return false; }
   });
   const [sessionId] = useState(() => {
-    try {
-      const saved = localStorage.getItem('session_id');
-      if (saved) return saved;
-      const id = crypto.randomUUID();
-      localStorage.setItem('session_id', id);
-      return id;
-    } catch {
-      return crypto.randomUUID();
-    }
+    // Start a fresh ephemeral session on each page load
+    return crypto.randomUUID();
   });
   const [isMinimized, setIsMinimized] = useState(() => {
     try { return localStorage.getItem('chat_min') === '1'; } catch { return false; }
@@ -88,6 +81,7 @@ const ChatWidget = () => {
   const { toast } = useToast();
   const { user } = useAuth();
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
 
   // NEW: animation mount + phase
   const [mounted, setMounted] = useState(false);
@@ -141,95 +135,12 @@ const ChatWidget = () => {
   const shortId = (id: string) => id.replace(/-/g, "").toUpperCase().slice(0, 8);
 
   const getCurrentSessionId = async (): Promise<string> => {
-    let currentSessionId = sessionId;
-    if (user && supabase) {
-      try {
-        const { data: sessionData } = await supabase
-          .from('sessions')
-          .select('id')
-          .eq('user_id', user.id)
-          .order('started_at', { ascending: false })
-          .limit(1)
-          .single();
-        if (sessionData) {
-          currentSessionId = sessionData.id;
-          try { localStorage.setItem('session_id', currentSessionId); } catch {}
-        }
-      } catch {}
-    }
-    return currentSessionId;
+    // Keep the new ephemeral session for this browser load
+    return sessionId;
   };
 
-  // Load past conversation from Supabase events for this session
-  useEffect(() => {
-    const loadHistory = async () => {
-      if (!isOpen || historyLoaded || !supabase) return;
-      // Determine the session id the same way as sendMessage
-      let currentSessionId = sessionId;
-      try {
-        if (user) {
-          const { data: sessionData } = await supabase
-            .from('sessions')
-            .select('id')
-            .eq('user_id', user.id)
-            .order('started_at', { ascending: false })
-            .limit(1)
-            .single();
-          if (sessionData) currentSessionId = sessionData.id;
-        }
-
-        const { data } = await supabase
-          .from('events')
-          .select('type,payload,created_at')
-          .eq('session_id', currentSessionId)
-          .order('created_at', { ascending: true });
-
-        if (Array.isArray(data) && data.length) {
-          const hydrated: Message[] = [];
-          data.forEach((row, idx) => {
-            const payload: any = row.payload || {};
-            if (row.type === 'chat_user') {
-              hydrated.push({
-                id: Date.now() + idx,
-                text: payload.text || '',
-                isUser: true,
-                timestamp: new Date(row.created_at || Date.now()),
-              });
-            } else if (row.type === 'chat_assistant') {
-              const m: Message = {
-                id: Date.now() + 1000 + idx,
-                text: payload.text || payload.output || '',
-                isUser: false,
-                timestamp: new Date(row.created_at || Date.now()),
-                kind: 'text',
-              };
-              if (Array.isArray(payload.products)) {
-                m.kind = 'products';
-                m.products = payload.products;
-              }
-              if (payload.cart) {
-                m.kind = 'cart';
-                m.cart = payload.cart;
-              }
-              hydrated.push(m);
-            }
-          });
-          if (hydrated.length) {
-            // Prepend system greeting only if history empty
-            setMessages((prev) => {
-              const withoutGreeting = prev.length === 1 && !prev[0].isUser ? [] : prev;
-              return [...withoutGreeting, ...hydrated];
-            });
-          }
-        }
-      } catch (e) {
-        // no-op
-      } finally {
-        setHistoryLoaded(true);
-      }
-    };
-    loadHistory();
-  }, [isOpen, historyLoaded, supabase, sessionId, user]);
+  // Do not auto-load past conversation on refresh; start fresh like a new chat
+  useEffect(() => { setHistoryLoaded(true); }, []);
 
   useEffect(() => {
     if (isOpen) {
@@ -253,6 +164,13 @@ const ChatWidget = () => {
       messagesEndRef.current.scrollIntoView({ behavior: "smooth" });
     }
   }, [messages, isOpen, isMinimized]);
+
+  // After the assistant finishes responding (input re-enabled), re-focus the input automatically
+  useEffect(() => {
+    if (!isLoading && isOpen && !isMinimized) {
+      try { inputRef.current?.focus({ preventScroll: true } as any); } catch { inputRef.current?.focus(); }
+    }
+  }, [isLoading, isOpen, isMinimized]);
 
   const sendMessage = async () => {
     if (!inputValue.trim()) return;
@@ -330,10 +248,18 @@ const ChatWidget = () => {
       if (Array.isArray(data?.products)) {
         botResponse.kind = "products";
         botResponse.products = data.products;
+        // Add a short heading for clarity while keeping carousel behavior
+        botResponse.text = data?.output && data.output.trim()
+          ? data.output
+          : "Here are the recommended products below.";
       }
       if (Array.isArray(data?.vouchers)) {
         botResponse.kind = "vouchers";
         botResponse.vouchers = data.vouchers;
+        // Add a heading for vouchers list
+        botResponse.text = data?.output && data.output.trim()
+          ? data.output
+          : "Below are the currently working vouchers.";
       }
       if (data?.cart) {
         botResponse.kind = "cart";
@@ -350,13 +276,71 @@ const ChatWidget = () => {
       setMessages((prev) => [...prev, botResponse]);
     } catch (error) {
       console.error("Error sending message:", error);
-      toast({
-        title: "Message processing",
-        description: "Your message could not be processed. Please try again.",
-      });
+      // Fallback: only show product suggestions if the user asked for products
+      try {
+        const wantsProducts = /\b(recommend|product|products|moist|moistur|serum|sunscreen|spf|cleanser|toner|mask|cream|lotion|gel|acne|brighten|hydrating)\b/i.test(messageText);
+        if (wantsProducts && supabase) {
+          const { data: list } = await supabase
+            .from('products')
+            .select('id, content, metadata')
+            .order('created_at', { ascending: false })
+            .limit(6);
+          const products = (list || []).map((row: any) => {
+            const md = row.metadata || {};
+            const name = md.title || row.content || 'Product';
+            const price = typeof md.price === 'number' ? md.price : (typeof md.price_min === 'number' ? md.price_min : 0);
+            const img = md.image_url || (Array.isArray(md.images) && md.images[0]?.src) || undefined;
+            const tags = Array.isArray(md.tags) ? md.tags : undefined;
+            return { id: row.id, name, price: Number(price), image_url: img, tags } as any;
+          });
+          if (products.length) {
+            const fallback: Message = {
+              id: Date.now() + 1,
+              text: 'Here are some popular options to get you started:',
+              isUser: false,
+              timestamp: new Date(),
+              kind: 'products',
+              products,
+            } as any;
+            setMessages((prev) => [...prev, fallback]);
+            return;
+          }
+        }
+      } catch {}
+      toast({ title: "Message processing", description: "Your message could not be processed. Please try again." });
     } finally {
       setIsLoading(false);
     }
+  };
+
+  // Update the most recent cart message in-place (no new chat bubble). If none exists, append one.
+  const upsertCartMessage = (payload: { text?: string; cart?: any }) => {
+    setMessages((prev) => {
+      const next = [...prev];
+      let idx = -1;
+      for (let i = next.length - 1; i >= 0; i--) {
+        if (next[i].kind === "cart") { idx = i; break; }
+      }
+      if (idx >= 0) {
+        const updated: Message = {
+          ...next[idx],
+          text: payload.text || next[idx].text,
+          cart: payload.cart ?? next[idx].cart,
+          timestamp: new Date(),
+        };
+        next[idx] = updated;
+        return next;
+      }
+      const newMsg: Message = {
+        id: Date.now() + 1,
+        text: payload.text || "",
+        isUser: false,
+        timestamp: new Date(),
+        kind: "cart",
+        cart: payload.cart as any,
+      };
+      return [...next, newMsg];
+    });
   };
 
   const addToCart = async (
@@ -368,6 +352,8 @@ const ChatWidget = () => {
     imageUrl?: string
   ) => {
     setIsLoading(true);
+    // Optimistic: show an in-place status so the user sees immediate feedback
+    upsertCartMessage({ text: `Adding ${productName}…` });
     try {
       const currentSessionId = await getCurrentSessionId();
       let data: any;
@@ -388,9 +374,120 @@ const ChatWidget = () => {
       } as any;
 
       if (supabase) {
-        const { data: fnData, error: fnErr } = await (supabase as any).functions.invoke('chat', { body: payload });
-        if (fnErr) throw fnErr;
-        data = fnData;
+        // Quick client-side fix: ensure cart and write directly to cart_products
+        try {
+          let cartId: string;
+          
+          // First, try to find an existing cart for this user or session
+          const { data: existingCarts, error: findErr } = await (supabase as any)
+            .from('carts')
+            .select('id')
+            .or(`user_id.eq.${user?.id || 'null'},session_id.eq.${currentSessionId}`)
+            .eq('status', 'active')
+            .order('created_at', { ascending: false })
+            .limit(1);
+          
+          if (!findErr && existingCarts && existingCarts.length > 0) {
+            cartId = existingCarts[0].id;
+          } else {
+            // If no cart exists, try to create one
+            const { data: ensured, error: ensureErr } = await (supabase as any).rpc('ensure_cart', { 
+              p_currency: 'IDR', 
+              p_session_id: currentSessionId, 
+              p_user_id: user?.id || null 
+            });
+            
+            if (ensureErr) {
+              // If ensure_cart fails due to constraint, find the existing cart
+              if (ensureErr.code === '23505') {
+                const { data: userCarts } = await (supabase as any)
+                  .from('carts')
+                  .select('id')
+                  .eq('user_id', user?.id)
+                  .eq('status', 'active')
+                  .order('created_at', { ascending: false })
+                  .limit(1);
+                
+                if (userCarts && userCarts.length > 0) {
+                  cartId = userCarts[0].id;
+                } else {
+                  throw new Error('Cart conflict but no active cart found');
+                }
+              } else {
+                throw ensureErr;
+              }
+            } else if (!ensured?.id) {
+              throw new Error('ensure_cart failed');
+            } else {
+              cartId = (ensured as any).id as string;
+            }
+          }
+          const variantId = variantId ?? productId ?? productName;
+          // Check if line exists
+          const { data: existing } = await (supabase as any)
+            .from('cart_products')
+            .select('id, qty')
+            .eq('cart_id', cartId)
+            .or(`variant_id.eq.${variantId},product_id.eq.${productId},title_snapshot.eq.${productName}`)
+            .order('updated_at', { ascending: false })
+            .limit(1);
+          const row = (existing || [])[0] || null;
+          if (row) {
+            await (supabase as any)
+              .from('cart_products')
+              .update({
+                qty: Math.max(1, (row.qty || 0) + (qty || 1)),
+                title_snapshot: productName,
+                unit_price: (unitPriceCents || 0) / 100,
+                image_url: imageUrl || null,
+                variant_id: variantId,
+                product_id: productId || productName,
+              })
+              .eq('id', row.id);
+          } else {
+            await (supabase as any)
+              .from('cart_products')
+              .insert({
+                cart_id: cartId,
+                product_id: productId || productName,
+                variant_id: variantId,
+                qty: Math.max(1, qty || 1),
+                unit_price: (unitPriceCents || 0) / 100,
+                title_snapshot: productName,
+                image_url: imageUrl || null,
+              });
+          }
+          // Read back cart lines and compute totals
+          const { data: lines } = await (supabase as any)
+            .from('cart_products')
+            .select('title_snapshot, qty, unit_price, image_url, product_id, variant_id')
+            .eq('cart_id', cartId)
+            .order('updated_at', { ascending: false });
+          const items = (lines || []).map((l: any) => ({
+            product_name: l.title_snapshot || l.product_id,
+            qty: l.qty || 0,
+            unit_price_cents: Math.round((l.unit_price || 0) * 100),
+            image_url: l.image_url || undefined,
+            product_id: l.product_id as string | undefined,
+            variant_id: l.variant_id as string | undefined,
+          }));
+          const subtotal = items.reduce((s: number, it: any) => s + (it.unit_price_cents || 0) * (it.qty || 0), 0);
+          data = {
+            output: `Added ${productName}.`,
+            cart: {
+              items,
+              subtotal_cents: subtotal,
+              discount_cents: 0,
+              total_cents: subtotal,
+              voucher_code: null,
+            },
+          };
+        } catch (clientPathErr) {
+          // Fallback to edge function if direct path fails
+          const { data: fnData, error: fnErr } = await (supabase as any).functions.invoke('chat', { body: payload });
+          if (fnErr) throw fnErr;
+          data = fnData;
+        }
       } else {
         if (!SUPABASE_FUNCTION_URL) throw new Error("Supabase Function URL missing");
         const response = await fetch(SUPABASE_FUNCTION_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
@@ -398,15 +495,40 @@ const ChatWidget = () => {
         data = await response.json();
       }
 
-      const botResponse: Message = {
-        id: Date.now() + 1,
-        text: data?.output || `Added ${productName}.`,
-        isUser: false,
-        timestamp: new Date(),
-        kind: data?.cart ? "cart" : "text",
-        cart: data?.cart || undefined,
-      };
-      setMessages((prev) => [...prev, botResponse]);
+      // Fallback: if no cart returned, explicitly fetch the cart snapshot
+      if (!data?.cart) {
+        const cartPayload: any = {
+          message: "",
+          intent: "get_cart_info",
+          session_id: currentSessionId,
+          user_id: user?.id || "anonymous",
+          user_email: user?.email || "anonymous@example.com",
+          timestamp: new Date().toISOString(),
+          source: "chat_widget",
+        };
+        try {
+          if (supabase) {
+            const { data: cartData } = await (supabase as any).functions.invoke('chat', { body: cartPayload });
+            if (cartData) data = { ...(data || {}), ...cartData };
+          } else if (SUPABASE_FUNCTION_URL) {
+            const r = await fetch(SUPABASE_FUNCTION_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cartPayload) });
+            if (r.ok) data = { ...(data || {}), ...(await r.json()) };
+          }
+        } catch {}
+      }
+
+      if (data?.cart) {
+        upsertCartMessage({ text: data?.output || `Added ${productName}.`, cart: data.cart });
+      } else {
+        const botResponse: Message = {
+          id: Date.now() + 1,
+          text: data?.output || `Added ${productName}.`,
+          isUser: false,
+          timestamp: new Date(),
+          kind: "text",
+        };
+        setMessages((prev) => [...prev, botResponse]);
+      }
     } catch (error) {
       console.error("Error adding to cart:", error);
       toast({ title: "Cart", description: "Could not add item to cart. Try again." });
@@ -417,6 +539,7 @@ const ChatWidget = () => {
 
   const clearCart = async () => {
     setIsLoading(true);
+    upsertCartMessage({ text: `Clearing cart…` });
     try {
       const currentSessionId = await getCurrentSessionId();
       let data: any;
@@ -439,15 +562,18 @@ const ChatWidget = () => {
         if (!response.ok) throw new Error("Network response was not ok");
         data = await response.json();
       }
-      const botResponse: Message = {
-        id: Date.now() + 1,
-        text: data?.output || `Cart cleared.`,
-        isUser: false,
-        timestamp: new Date(),
-        kind: data?.cart ? "cart" : "text",
-        cart: data?.cart || undefined,
-      };
-      setMessages((prev) => [...prev, botResponse]);
+      if (data?.cart) {
+        upsertCartMessage({ text: data?.output || `Cart cleared.`, cart: data.cart });
+      } else {
+        const botResponse: Message = {
+          id: Date.now() + 1,
+          text: data?.output || `Cart cleared.`,
+          isUser: false,
+          timestamp: new Date(),
+          kind: "text",
+        };
+        setMessages((prev) => [...prev, botResponse]);
+      }
     } catch (error) {
       console.error("Error clearing cart:", error);
       toast({ title: "Cart", description: "Could not clear cart. Try again." });
@@ -458,6 +584,7 @@ const ChatWidget = () => {
 
   const applyVoucher = async (code: string) => {
     setIsLoading(true);
+    upsertCartMessage({ text: `Applying ${code}…` });
     try {
       const currentSessionId = await getCurrentSessionId();
       const payload: any = {
@@ -482,15 +609,18 @@ const ChatWidget = () => {
         data = await response.json();
       }
 
-      const botResponse: Message = {
-        id: Date.now() + 1,
-        text: data?.output || `Applied ${code}.`,
-        isUser: false,
-        timestamp: new Date(),
-        kind: data?.cart ? "cart" : "text",
-        cart: data?.cart || undefined,
-      };
-      setMessages((prev) => [...prev, botResponse]);
+      if (data?.cart) {
+        upsertCartMessage({ text: data?.output || `Applied ${code}.`, cart: data.cart });
+      } else {
+        const botResponse: Message = {
+          id: Date.now() + 1,
+          text: data?.output || `Applied ${code}.`,
+          isUser: false,
+          timestamp: new Date(),
+          kind: "text",
+        };
+        setMessages((prev) => [...prev, botResponse]);
+      }
     } catch (e) {
       toast({ title: "Voucher", description: "Could not apply voucher." });
     } finally {
@@ -498,8 +628,9 @@ const ChatWidget = () => {
     }
   };
 
-  const updateLineQty = async (line: { product_name: string; product_id?: string; variant_id?: string }, qty: number) => {
+  const updateLineQty = async (line: { product_name: string; product_id?: string; variant_id?: string; unit_price_cents?: number; image_url?: string }, qty: number) => {
     setIsLoading(true);
+    upsertCartMessage({ text: `Updating ${line.product_name}…` });
     try {
       const currentSessionId = await getCurrentSessionId();
       const payload: any = {
@@ -508,6 +639,8 @@ const ChatWidget = () => {
         product_name: line.product_name,
         product_id: line.product_id,
         variant_id: line.variant_id,
+        unit_price_cents: (line as any).unit_price_cents,
+        image_url: (line as any).image_url,
         qty,
         session_id: currentSessionId,
         user_id: user?.id || "anonymous",
@@ -526,15 +659,30 @@ const ChatWidget = () => {
         if (!response.ok) throw new Error("Network response was not ok");
         data = await response.json();
       }
-      const botResponse: Message = {
-        id: Date.now() + 1,
-        text: data?.output || `Updated ${line.product_name}.`,
-        isUser: false,
-        timestamp: new Date(),
-        kind: data?.cart ? "cart" : "text",
-        cart: data?.cart || undefined,
-      };
-      setMessages((prev) => [...prev, botResponse]);
+      if (!data?.cart) {
+        const cartPayload: any = { message: "", intent: "get_cart_info", session_id: currentSessionId, user_id: user?.id || "anonymous", user_email: user?.email || "anonymous@example.com", timestamp: new Date().toISOString(), source: "chat_widget" };
+        try {
+          if (supabase) {
+            const { data: cartData } = await (supabase as any).functions.invoke('chat', { body: cartPayload });
+            if (cartData) data = { ...(data || {}), ...cartData };
+          } else if (SUPABASE_FUNCTION_URL) {
+            const r = await fetch(SUPABASE_FUNCTION_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cartPayload) });
+            if (r.ok) data = { ...(data || {}), ...(await r.json()) };
+          }
+        } catch {}
+      }
+      if (data?.cart) {
+        upsertCartMessage({ text: data?.output || `Updated ${line.product_name}.`, cart: data.cart });
+      } else {
+        const botResponse: Message = {
+          id: Date.now() + 1,
+          text: data?.output || `Updated ${line.product_name}.`,
+          isUser: false,
+          timestamp: new Date(),
+          kind: "text",
+        };
+        setMessages((prev) => [...prev, botResponse]);
+      }
     } catch (e) {
       toast({ title: "Cart", description: "Could not update quantity" });
     } finally {
@@ -544,6 +692,7 @@ const ChatWidget = () => {
 
   const deleteLine = async (line: { product_name: string; product_id?: string; variant_id?: string }) => {
     setIsLoading(true);
+    upsertCartMessage({ text: `Removing ${line.product_name}…` });
     try {
       const currentSessionId = await getCurrentSessionId();
       const payload: any = {
@@ -569,15 +718,30 @@ const ChatWidget = () => {
         if (!response.ok) throw new Error("Network response was not ok");
         data = await response.json();
       }
-      const botResponse: Message = {
-        id: Date.now() + 1,
-        text: data?.output || `Removed ${line.product_name}.`,
-        isUser: false,
-        timestamp: new Date(),
-        kind: data?.cart ? "cart" : "text",
-        cart: data?.cart || undefined,
-      };
-      setMessages((prev) => [...prev, botResponse]);
+      if (!data?.cart) {
+        const cartPayload: any = { message: "", intent: "get_cart_info", session_id: currentSessionId, user_id: user?.id || "anonymous", user_email: user?.email || "anonymous@example.com", timestamp: new Date().toISOString(), source: "chat_widget" };
+        try {
+          if (supabase) {
+            const { data: cartData } = await (supabase as any).functions.invoke('chat', { body: cartPayload });
+            if (cartData) data = { ...(data || {}), ...cartData };
+          } else if (SUPABASE_FUNCTION_URL) {
+            const r = await fetch(SUPABASE_FUNCTION_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cartPayload) });
+            if (r.ok) data = { ...(data || {}), ...(await r.json()) };
+          }
+        } catch {}
+      }
+      if (data?.cart) {
+        upsertCartMessage({ text: data?.output || `Removed ${line.product_name}.`, cart: data.cart });
+      } else {
+        const botResponse: Message = {
+          id: Date.now() + 1,
+          text: data?.output || `Removed ${line.product_name}.`,
+          isUser: false,
+          timestamp: new Date(),
+          kind: "text",
+        };
+        setMessages((prev) => [...prev, botResponse]);
+      }
     } catch (e) {
       toast({ title: "Cart", description: "Could not remove item" });
     } finally {
@@ -809,7 +973,7 @@ const ChatWidget = () => {
                                               size="icon"
                                               className="h-6 w-6"
                                               aria-label="Decrease quantity"
-                                              onClick={() => updateLineQty({ product_name: it.product_name, product_id: (it as any).product_id, variant_id: (it as any).variant_id }, Math.max(0, (it.qty || 0) - 1))}
+                                              onClick={() => updateLineQty({ product_name: it.product_name, product_id: (it as any).product_id, variant_id: (it as any).variant_id, unit_price_cents: (it as any).unit_price_cents, image_url: (it as any).image_url }, Math.max(0, (it.qty || 0) - 1))}
                                             >
                                               -
                                             </Button>
@@ -819,7 +983,7 @@ const ChatWidget = () => {
                                               size="icon"
                                               className="h-6 w-6"
                                               aria-label="Increase quantity"
-                                              onClick={() => updateLineQty({ product_name: it.product_name, product_id: (it as any).product_id, variant_id: (it as any).variant_id }, (it.qty || 0) + 1)}
+                                              onClick={() => updateLineQty({ product_name: it.product_name, product_id: (it as any).product_id, variant_id: (it as any).variant_id, unit_price_cents: (it as any).unit_price_cents, image_url: (it as any).image_url }, (it.qty || 0) + 1)}
                                             >
                                               +
                                             </Button>
@@ -883,6 +1047,7 @@ const ChatWidget = () => {
                 <div className="p-4 border-t border-gray-200 bg-white">
                   <div className="flex space-x-2">
                     <Input
+                      ref={inputRef}
                       value={inputValue}
                       onChange={(e) => setInputValue(e.target.value)}
                       onKeyPress={handleKeyPress}

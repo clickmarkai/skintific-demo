@@ -180,6 +180,106 @@ async function persistCart(sessionId: string, cart: Cart) {
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const CHAT_MODEL = process.env.CHAT_MODEL || "gpt-4o-mini";
 
+// Basic normalization and synonym expansion for product queries
+function normalizeQuery(input: string) {
+  const q = (input || "").toLowerCase().trim();
+  // common misspellings and synonyms
+  const synonyms: Record<string, string[]> = {
+    moisturizer: ["moisturizer", "moisturiser", "mosturizer", "moist", "hydrating", "gel", "cream", "lotion"],
+    serum: ["serum"],
+    sunscreen: ["sunscreen", "spf", "sun block", "sunblock"],
+    cleanser: ["cleanser", "face wash", "wash"],
+    toner: ["toner"],
+  };
+  const matched = Object.entries(synonyms).find(([, words]) => words.some((w) => q.includes(w)));
+  if (matched) return { root: matched[0], terms: matched[1] } as { root: string; terms: string[] };
+  // default: split into terms
+  const tokens = q.split(/[^a-z0-9]+/).filter(Boolean);
+  return { root: tokens[0] || q, terms: tokens } as { root: string; terms: string[] };
+}
+
+async function searchProductsFromDB(query: string, limit = 6) {
+  if (!supabaseSrv) return [] as Array<{ id: string; name: string; price?: number; image_url?: string; tags?: string[]; variant_id?: string }>;
+  const { root, terms } = normalizeQuery(query);
+  // Prefer semantic search via RPC if available, else fallback to keyword search
+  try {
+    // Try semantic search first when embeddings exist
+    try {
+      // Create a temporary embedding using OpenAI if key is provided; fall back to keyword if not
+      if (OPENAI_API_KEY) {
+        const embedRes = await fetch("https://api.openai.com/v1/embeddings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${OPENAI_API_KEY}` },
+          body: JSON.stringify({
+            model: process.env.EMBED_MODEL || "text-embedding-3-small",
+            input: query,
+          }),
+        });
+        if (embedRes.ok) {
+          const embedData = await embedRes.json();
+          const embedding = embedData?.data?.[0]?.embedding as number[] | undefined;
+          if (embedding && Array.isArray(embedding)) {
+            const { data: matches } = await (supabaseSrv as any).rpc('match_products', {
+              query_embedding: embedding,
+              match_threshold: 0.2,
+              match_count: Math.max(3, Math.min(limit, 12)),
+            });
+            if (Array.isArray(matches) && matches.length) {
+              const mapped = matches.map((row: any) => {
+                const md = row.metadata || {};
+                const firstImage = Array.isArray(md.images) && md.images.length ? (md.images[0]?.src as string) : undefined;
+                return {
+                  id: row.id as string,
+                  name: (md.title as string) || (row.content as string)?.slice(0, 80) || "Product",
+                  price: typeof md.price === "number" ? md.price : undefined,
+                  image_url: (md.image_url as string) || firstImage,
+                  tags: (md.tags as string[]) || [],
+                  variant_id: (row.variant_id as string) || undefined,
+                };
+              });
+              return mapped;
+            }
+          }
+        }
+      }
+    } catch {}
+
+    // Attempt a lightweight keyword search over title/content/tags
+    // Using OR filters on jsonb fields
+    const likeTerms = [root, ...terms].filter((v, i, a) => v && a.indexOf(v) === i);
+    const orClauses: string[] = [];
+    for (const term of likeTerms) {
+      const pat = `%${term}%`;
+      orClauses.push(`metadata->>title.ilike.${pat}`);
+      orClauses.push(`content.ilike.${pat}`);
+      // simple tag match when tags is an array of strings
+      orClauses.push(`metadata->tags.cs.{${term}}`);
+      orClauses.push(`metadata->>type.ilike.${pat}`);
+    }
+    const { data } = await (supabaseSrv as any)
+      .from("products")
+      .select("id, content, metadata")
+      .or(orClauses.join(","))
+      .limit(Math.max(3, Math.min(limit, 12)));
+
+    const mapped = (data || []).map((row: any) => {
+      const md = row.metadata || {};
+      const firstImage = Array.isArray(md.images) && md.images.length ? (md.images[0]?.src as string) : undefined;
+      return {
+        id: row.id as string,
+        name: (md.title as string) || (row.content as string)?.slice(0, 80) || "Product",
+        price: typeof md.price === "number" ? md.price : undefined,
+        image_url: (md.image_url as string) || firstImage,
+        tags: (md.tags as string[]) || [],
+        variant_id: (row.variant_id as string) || undefined,
+      };
+    });
+    return mapped;
+  } catch {
+    return [] as Array<{ id: string; name: string; price?: number; image_url?: string; tags?: string[]; variant_id?: string }>;
+  }
+}
+
 async function extractIntentLLM(message: string): Promise<Partial<{ intent: Intent; product_name: string; qty: number; voucher_name: string }>> {
   if (!OPENAI_API_KEY) return {};
   const system = `You are a router for a skincare e-commerce assistant. Output ONLY JSON with: intent (one of get_cart_info, add_line, edit_line, delete_line, delete_cart, apply_voucher, product_reco, ticket, checkout), product_name (string or empty), qty (number), voucher_name (string or empty). If user asks discounts/promos, set intent=apply_voucher.`;
@@ -256,8 +356,21 @@ export const handler: Handler = async (event) => {
     if (typeof body.qty === 'number') hintedQty = body.qty;
     if (typeof body.voucher_name === 'string') hintedVoucher = body.voucher_name;
     if (intent === "product_reco") {
-      const resultsRaw = searchProducts(message, 6);
-      const results = (resultsRaw.length >= 3 ? resultsRaw : CAT_PRODUCTS).slice(0, Math.max(3, Math.min(6, resultsRaw.length || 3)));
+      // Prefer DB-backed search to ensure results match the user's request (e.g. moisturizer)
+      const dbResults = await searchProductsFromDB(message, 6);
+      let results: Array<any> = dbResults.map((p) => ({
+        id: p.id,
+        name: p.name,
+        price: p.price,
+        image_url: p.image_url,
+        tags: p.tags,
+        variant_id: p.variant_id,
+      }));
+      if (!results.length) {
+        // Fallback to in-memory demo catalog
+        const demo = searchProducts(message, 6);
+        results = demo.map((d) => ({ name: d.name, price_cents: d.price_cents, image_url: d.image_url, tags: d.tags }));
+      }
       const output = results.length > 0
         ? `Here are some recommendations to consider for your routine:`
         : `I couldn’t find an exact match, but here are some popular options:`;
@@ -297,59 +410,147 @@ export const handler: Handler = async (event) => {
     }
 
     if (intent === "add_line" || intent === "edit_line" || intent === "delete_line") {
-      const searchQ = hintedProduct || message;
-      const matches = searchProducts(searchQ, 5);
-      if (matches.length === 0) {
-        return { statusCode: 200, headers, body: JSON.stringify({ output: "I couldn’t find that product. Could you specify the name?" }) };
-      }
-      if (matches.length > 1) {
-        if (awaitingClarification.get(sessionId)) {
-          // escalate to ticket per one-clarification rule
-          const { ticket_id } = await createTicket(sessionId, body.user_email, "Product clarification needed", `User message: ${message}`, "product_info", "normal");
-          const short = ticket_id.replace(/-/g, "").toUpperCase().slice(0, 8);
-          const output = `I’ve opened ticket #${short} so our skincare team can help you choose the exact product. If you’d like updates by email, please share it here.`;
-          awaitingClarification.delete(sessionId);
-          await saveMessage(sessionId, "assistant", output);
-          return { statusCode: 200, headers, body: JSON.stringify({ output, ticket_id }) };
-        }
-        awaitingClarification.set(sessionId, true);
-        const names = matches.slice(0, 3).map((p) => p.name).join(" or ");
-        const output = `Did you mean ${names}?`;
-        return { statusCode: 200, headers, body: JSON.stringify({ output }) };
-      }
-      awaitingClarification.delete(sessionId);
-      const product = matches[0];
-      const qty = hintedQty || extractQty(message);
-      const idx = cart.items.findIndex((l) => l.product_name === product.name);
-      if (intent === "add_line") {
-        if (idx >= 0) cart.items[idx].qty += qty; else cart.items.push({ product_name: product.name, qty, unit_price_cents: product.price_cents, image_url: product.image_url });
-      } else if (intent === "edit_line") {
-        if (idx >= 0) cart.items[idx].qty = qty; else cart.items.push({ product_name: product.name, qty, unit_price_cents: product.price_cents, image_url: product.image_url });
-      } else if (intent === "delete_line") {
-        if (idx >= 0) cart.items.splice(idx, 1);
-      }
-      recomputeTotals(cart);
-      // Persist to Supabase using RPCs when available
+      // Extract product info from request body if available
+      const requestedProductId = body.product_id;
+      const requestedVariantId = body.variant_id;
+      const requestedProductName = body.product_name || hintedProduct;
+      const requestedQty = body.qty || hintedQty || extractQty(message);
+      const requestedPrice = body.unit_price_cents;
+      const requestedImage = body.image_url;
+      
       try {
         if (supabaseSrv) {
-          const { data: ensured } = await supabaseSrv.rpc('ensure_cart', { p_currency: 'USD', p_session_id: sessionId, p_user_id: body.user_id || null });
-          if (ensured?.id) {
-            if (intent === 'add_line' || intent === 'edit_line') {
-              await supabaseSrv.rpc('cart_add_line', { p_cart_id: ensured.id, p_variant_gid: product.name, p_qty: qty, p_unit_price: product.price_cents, p_product_id: product.name, p_image: product.image_url || null, p_title: product.name, p_vendor: null });
-              if (intent === 'edit_line') {
-                await supabaseSrv.rpc('cart_set_qty', { p_cart_id: ensured.id, p_qty: qty, p_variant_gid: product.name });
-              }
-            } else if (intent === 'delete_line') {
-              await supabaseSrv.rpc('cart_remove_line', { p_cart_id: ensured.id, p_variant_gid: product.name });
+          // Ensure cart exists
+          const { data: ensured, error: ensureErr } = await supabaseSrv.rpc('ensure_cart', { 
+            p_currency: 'IDR', 
+            p_session_id: sessionId, 
+            p_user_id: body.user_id || null 
+          });
+          
+          if (ensureErr || !ensured?.id) {
+            console.error('ensure_cart failed:', ensureErr);
+            return { statusCode: 500, headers, body: JSON.stringify({ error: "Cart unavailable" }) };
+          }
+          
+          const cartId = ensured.id;
+          
+          // For delete, we need to find the existing line
+          if (intent === 'delete_line') {
+            // Try to find line by variant_id, product_id, or title
+            const { data: lines } = await supabaseSrv
+              .from('cart_products')
+              .select('id')
+              .eq('cart_id', cartId)
+              .or(`variant_id.eq.${requestedVariantId || 'null'},product_id.eq.${requestedProductId || 'null'},title_snapshot.eq.${requestedProductName || 'null'}`)
+              .limit(1);
+            
+            if (lines && lines.length > 0) {
+              await supabaseSrv
+                .from('cart_products')
+                .delete()
+                .eq('id', lines[0].id);
+            }
+          } else {
+            // For add/edit, check if line exists
+            const { data: existing } = await supabaseSrv
+              .from('cart_products')
+              .select('id, qty')
+              .eq('cart_id', cartId)
+              .or(`variant_id.eq.${requestedVariantId || 'null'},product_id.eq.${requestedProductId || 'null'},title_snapshot.eq.${requestedProductName || 'null'}`)
+              .limit(1);
+            
+            const existingLine = existing && existing.length > 0 ? existing[0] : null;
+            
+            if (existingLine) {
+              // Update existing line
+              const newQty = intent === 'add_line' 
+                ? (existingLine.qty || 0) + (requestedQty || 1)
+                : (requestedQty || 1);
+                
+              await supabaseSrv
+                .from('cart_products')
+                .update({
+                  qty: Math.max(1, newQty),
+                  unit_price: (requestedPrice || 0) / 100,
+                  title_snapshot: requestedProductName || 'Unknown Product',
+                  image_url: requestedImage || null,
+                })
+                .eq('id', existingLine.id);
+            } else {
+              // Insert new line
+              await supabaseSrv
+                .from('cart_products')
+                .insert({
+                  cart_id: cartId,
+                  product_id: requestedProductId || requestedProductName || 'unknown',
+                  variant_id: requestedVariantId || requestedProductId || requestedProductName || 'unknown',
+                  qty: Math.max(1, requestedQty || 1),
+                  unit_price: (requestedPrice || 0) / 100,
+                  title_snapshot: requestedProductName || 'Unknown Product',
+                  image_url: requestedImage || null,
+                });
             }
           }
+          
+          // Fetch updated cart
+          const updatedCart = await fetchCartItems(cartId, 'IDR');
+          const output = intent === "delete_line" 
+            ? `Removed ${requestedProductName}.`
+            : intent === "edit_line"
+            ? `Updated ${requestedProductName} quantity to ${requestedQty}.`
+            : `Added ${requestedProductName} to cart.`;
+            
+          await logEvent(supabaseSrv, sessionId, body.user_id, 'user', message || intent);
+          await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', output);
+          
+          return { statusCode: 200, headers, body: JSON.stringify({ output, cart: updatedCart, returnCart: true }) };
+        } else {
+          // Fallback to in-memory cart
+          const searchQ = requestedProductName || hintedProduct || message;
+          const matches = searchProducts(searchQ, 5);
+          if (matches.length === 0) {
+            return { statusCode: 200, headers, body: JSON.stringify({ output: "I couldn't find that product. Could you specify the name?" }) };
+          }
+          const product = matches[0];
+          const qty = requestedQty || hintedQty || extractQty(message);
+          const idx = cart.items.findIndex((l) => l.product_name === product.name);
+          
+          if (intent === "add_line") {
+            if (idx >= 0) cart.items[idx].qty += qty; 
+            else cart.items.push({ 
+              product_name: product.name, 
+              qty, 
+              unit_price_cents: product.price_cents, 
+              image_url: product.image_url 
+            });
+          } else if (intent === "edit_line") {
+            if (idx >= 0) cart.items[idx].qty = qty; 
+            else cart.items.push({ 
+              product_name: product.name, 
+              qty, 
+              unit_price_cents: product.price_cents, 
+              image_url: product.image_url 
+            });
+          } else if (intent === "delete_line") {
+            if (idx >= 0) cart.items.splice(idx, 1);
+          }
+          
+          recomputeTotals(cart);
+          await persistCart(sessionId, cart);
+          
+          const output = intent === "delete_line" 
+            ? `Removed ${product.name}.`
+            : `Updated ${product.name}. New total ${currency(cart.total_cents)}.`;
+            
+          await saveMessage(sessionId, "user", message);
+          await saveMessage(sessionId, "assistant", output);
+          
+          return { statusCode: 200, headers, body: JSON.stringify({ output, cart }) };
         }
-      } catch {}
-      const output = `${intent === "delete_line" ? "Removed" : "Updated"} ${product.name}. New total ${currency(cart.total_cents)}.`;
-      await persistCart(sessionId, cart);
-      await saveMessage(sessionId, "user", message);
-      await saveMessage(sessionId, "assistant", output);
-      return { statusCode: 200, headers, body: JSON.stringify({ output, cart }) };
+      } catch (error) {
+        console.error('Cart operation error:', error);
+        return { statusCode: 500, headers, body: JSON.stringify({ error: "Cart unavailable" }) };
+      }
     }
 
     if (intent === "apply_voucher") {
