@@ -1,7 +1,7 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.43.2';
 
-const OPENAI_API_KEY = Deno.env.get('OPENAI_API_KEY');
+const VITE_OPENAI_API_KEY = Deno.env.get('VITE_OPENAI_API_KEY');
 const CHAT_MODEL = Deno.env.get('CHAT_MODEL') || 'gpt-4o-mini';
 
 interface LineItem {
@@ -40,8 +40,8 @@ const detectIntent = (message: string): string => {
 const fetchCartItems = async (cartId: string, currency: string = 'IDR'): Promise<Cart> => {
   try {
     const supabase = createClient(
-      Deno.env.get('SUPABASE_URL')!,
-      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
+      Deno.env.get('VITE_SUPABASE_URL')!,
+      Deno.env.get('VITE_SUPABASE_SERVICE_ROLE_KEY')!
     );
 
     const { data: lines, error: linesErr } = await supabase
@@ -108,8 +108,8 @@ serve(async (req) => {
     const intent = hintedIntent || detectIntent(message);
 
     const supabaseSrv = createClient(
-      Deno.env.get('SUPABASE_URL')!,
-      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
+      Deno.env.get('VITE_SUPABASE_URL')!,
+      Deno.env.get('VITE_SUPABASE_SERVICE_ROLE_KEY')!
     );
 
     if (intent === "get_cart_info") {

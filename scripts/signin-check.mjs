@@ -8,7 +8,7 @@ async function main() {
     console.error('Usage: node scripts/signin-check.mjs <email> <password>')
     process.exit(1)
   }
-  const url = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL
+  const url = process.env.VITE_SUPABASE_URL || process.env.VITE_SUPABASE_URL
   const anon = process.env.VITE_SUPABASE_ANON_KEY
   if (!url || !anon) {
     console.error('Missing VITE_SUPABASE_URL or VITE_SUPABASE_ANON_KEY')

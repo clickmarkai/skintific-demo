@@ -81,9 +81,9 @@ Steps:
    - `VITE_SUPABASE_URL`
    - `VITE_SUPABASE_ANON_KEY`
    - `VITE_CHAT_API_URL` (frontend)
-   - `OPENAI_API_KEY` (function)
-   - `SUPABASE_URL` (function)
-   - `SUPABASE_SERVICE_ROLE_KEY` (function)
+   - `VITE_OPENAI_API_KEY` (function)
+   - `VITE_SUPABASE_URL` (function)
+   - `VITE_SUPABASE_SERVICE_ROLE_KEY` (function)
 
 ### Netlify Functions
 
@@ -98,8 +98,8 @@ VITE_CHAT_API_URL=/.netlify/functions/chat
 ### Chat & AI Setup
 
 - Set your OpenAI key:
-  - Local: create `.env` with `OPENAI_API_KEY=...` and `VITE_CHAT_API_URL=/.netlify/functions/chat`.
-  - Netlify: set `OPENAI_API_KEY` in Site settings > Environment variables.
+  - Local: create `.env` with `VITE_OPENAI_API_KEY=...` and `VITE_CHAT_API_URL=/.netlify/functions/chat`.
+  - Netlify: set `VITE_OPENAI_API_KEY` in Site settings > Environment variables.
 - The chat UI is in `src/components/ChatWidget.tsx`. It sends requests to the value in `VITE_CHAT_API_URL` and renders rich responses (products, cart, tickets) from the function.
 
 ### Testing

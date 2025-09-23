@@ -123,10 +123,10 @@ function isOutOfScope(t: string) {
 }
 
 // Optional Supabase server client (service role) for persistence
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const hasSupabase = Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
-const supabaseSrv = hasSupabase ? createClient<Database>(SUPABASE_URL as string, SUPABASE_SERVICE_ROLE_KEY as string) : null;
+const VITE_SUPABASE_URL = process.env.VITE_SUPABASE_URL;
+const VITE_SUPABASE_SERVICE_ROLE_KEY = process.env.VITE_SUPABASE_SERVICE_ROLE_KEY;
+const hasSupabase = Boolean(VITE_SUPABASE_URL && VITE_SUPABASE_SERVICE_ROLE_KEY);
+const supabaseSrv = hasSupabase ? createClient<Database>(VITE_SUPABASE_URL as string, VITE_SUPABASE_SERVICE_ROLE_KEY as string) : null;
 
 async function saveMessage(sessionId: string, role: "user" | "assistant", content: string) {
   if (!supabaseSrv) return;
@@ -177,7 +177,7 @@ async function persistCart(sessionId: string, cart: Cart) {
 }
 
 // Optional OpenAI intent extraction
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const VITE_OPENAI_API_KEY = process.env.VITE_OPENAI_API_KEY;
 const CHAT_MODEL = process.env.CHAT_MODEL || "gpt-4o-mini";
 
 // Basic normalization and synonym expansion for product queries
@@ -206,10 +206,10 @@ async function searchProductsFromDB(query: string, limit = 6) {
     // Try semantic search first when embeddings exist
     try {
       // Create a temporary embedding using OpenAI if key is provided; fall back to keyword if not
-      if (OPENAI_API_KEY) {
+      if (VITE_OPENAI_API_KEY) {
         const embedRes = await fetch("https://api.openai.com/v1/embeddings", {
           method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${OPENAI_API_KEY}` },
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${VITE_OPENAI_API_KEY}` },
           body: JSON.stringify({
             model: process.env.EMBED_MODEL || "text-embedding-3-small",
             input: query,
@@ -281,13 +281,13 @@ async function searchProductsFromDB(query: string, limit = 6) {
 }
 
 async function extractIntentLLM(message: string): Promise<Partial<{ intent: Intent; product_name: string; qty: number; voucher_name: string }>> {
-  if (!OPENAI_API_KEY) return {};
+  if (!VITE_OPENAI_API_KEY) return {};
   const system = `You are a router for a skincare e-commerce assistant. Output ONLY JSON with: intent (one of get_cart_info, add_line, edit_line, delete_line, delete_cart, apply_voucher, product_reco, ticket, checkout), product_name (string or empty), qty (number), voucher_name (string or empty). If user asks discounts/promos, set intent=apply_voucher.`;
   const user = message;
   try {
     const res = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${OPENAI_API_KEY}` },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${VITE_OPENAI_API_KEY}` },
       body: JSON.stringify({
         model: CHAT_MODEL,
         messages: [
@@ -342,7 +342,7 @@ export const handler: Handler = async (event) => {
     let hintedVoucher: string | undefined;
     let hintedQty: number | undefined;
 
-    if (OPENAI_API_KEY && !body.intent) {
+    if (VITE_OPENAI_API_KEY && !body.intent) {
       const llm = await extractIntentLLM(message);
       if (llm.intent) intent = llm.intent;
       hintedProduct = (llm as any).product_name || undefined;
