@@ -78,7 +78,7 @@ const ChatWidget = () => {
   const [isOpen, setIsOpen] = useState(() => {
     try { return localStorage.getItem('chat_open') === '1'; } catch { return false; }
   });
-  const [sessionId] = useState(() => {
+  const [sessionId, setSessionId] = useState(() => {
     try {
       const existing = localStorage.getItem('chat_session_id');
       if (existing) return existing;
@@ -242,6 +242,27 @@ const ChatWidget = () => {
     }
   });
 
+  // Start a brand new chat session (reset session_id and local UI state)
+  const handleNewChatSession = () => {
+    try {
+      const prev = localStorage.getItem('chat_session_id') || '';
+      if (prev) {
+        try { localStorage.removeItem(`chat_vouchers_shown_${prev}`); } catch {}
+      }
+      const fresh = crypto.randomUUID();
+      localStorage.setItem('chat_session_id', fresh);
+      // Optional: keep global session_id in sync if used elsewhere
+      try { localStorage.setItem('session_id', fresh); } catch {}
+      setSessionId(fresh);
+      setVouchersShown(false);
+      lastCartHashRef.current = null;
+      setMessages([{ id: Date.now(), text: 'Hello! How can I help you today?', isUser: false, timestamp: new Date(), kind: 'text' } as any]);
+      // Also close any modals and reset preview
+      setShowBundleModal(false);
+      setImgPreview(null);
+    } catch {}
+  };
+
   // Navigate helper: ensure bundle modal opens on cart page
   const handleGoToCart = () => {
     try { localStorage.setItem('chat_show_bundles', '1'); } catch {}
@@ -281,7 +302,13 @@ const ChatWidget = () => {
 
   const refreshCartFromServer = async () => {
     try {
-      if (Date.now() < suppressCartSyncUntilRef.current) return;
+      // Allow external updates to override suppression (from cart page bundle adds)
+      const now = Date.now();
+      if (now < suppressCartSyncUntilRef.current) {
+        console.log('Suppressing cart sync for', suppressCartSyncUntilRef.current - now, 'ms');
+        return;
+      }
+      
       const currentSessionId = await getCurrentSessionId();
       let data: any = null;
       if (supabase) {
@@ -453,6 +480,8 @@ useEffect(() => {
 
       if (addResp?.cart) {
         upsertCartMessage({ text: 'Bundle added to cart.', cart: addResp.cart });
+        // Broadcast sync so Cart page updates immediately
+        markCartUpdated(0);
       } else if (!addResp?.cart) {
         // Fallback: add or update each line individually with discounted price
         const discountPercent = Number(bundle?.discount_percent || 10);
@@ -511,17 +540,24 @@ useEffect(() => {
         try {
           if (supabase) {
             const { data: d } = await (supabase as any).functions.invoke('chat', { body: { intent: 'get_cart_info', session_id: currentSessionId, user_id: user?.id || 'anonymous' } });
-            if (d?.cart) upsertCartMessage({ text: 'Bundle added to cart.', cart: d.cart });
+            if (d?.cart) {
+              upsertCartMessage({ text: 'Bundle added to cart.', cart: d.cart });
+              markCartUpdated(0);
+            }
           } else if (SUPABASE_FUNCTION_URL) {
             const r3 = await fetch(SUPABASE_FUNCTION_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ intent: 'get_cart_info', session_id: currentSessionId, user_id: user?.id || 'anonymous' }) });
             if (r3.ok) {
               const d = await r3.json();
-              if (d?.cart) upsertCartMessage({ text: 'Bundle added to cart.', cart: d.cart });
+              if (d?.cart) {
+                upsertCartMessage({ text: 'Bundle added to cart.', cart: d.cart });
+                markCartUpdated(0);
+              }
             }
           }
         } catch {}
       } else if (data?.cart) {
         upsertCartMessage({ text: 'Bundle added to cart.', cart: data.cart });
+        markCartUpdated(0);
       }
       try { localStorage.setItem('bundle_applied', '1'); } catch {}
       // Navigate to cart page after success
@@ -1139,7 +1175,7 @@ useEffect(() => {
           // Immediately reflect in UI without waiting for remote sync
           upsertCartMessage({ text: 'Cart updated.', cart: data.cart });
           // Don't immediately trigger remote refresh that could return an older snapshot
-          markCartUpdated(1500);
+          markCartUpdated(300);
         } catch (clientPathErr) {
           // Fallback to edge function if direct path fails
           const { data: fnData, error: fnErr } = await (supabase as any).functions.invoke('chat', { body: payload });
@@ -1177,7 +1213,7 @@ useEffect(() => {
 
       if (data?.cart) {
         upsertCartMessage({ text: data?.output || `Cart updated.`, cart: data.cart });
-        markCartUpdated(1000);
+        markCartUpdated(300);
         // If backend provides upsell, render below as a products carousel with a short heading
         if (Array.isArray(data?.upsell) && data.upsell.length) {
           const upsellMsg: Message = {
@@ -1307,7 +1343,7 @@ useEffect(() => {
       }
       if (data?.cart) {
         upsertCartMessage({ text: data?.output || `Cart cleared.`, cart: data.cart });
-        markCartUpdated(1000);
+        markCartUpdated(300);
       } else {
         const botResponse: Message = {
           id: Date.now() + 1,
@@ -1419,7 +1455,7 @@ useEffect(() => {
       }
       if (data?.cart) {
         upsertCartMessage({ text: data?.output || `Updated ${line.product_name}.`, cart: data.cart });
-        markCartUpdated(1000);
+        markCartUpdated(300);
       } else {
         const botResponse: Message = {
           id: Date.now() + 1,
@@ -1430,7 +1466,7 @@ useEffect(() => {
         };
         setMessages((prev) => { const next = [...prev, botResponse]; playNotify(); return next; });
         try { if (supabase) { await (supabase as any).from('n8n_chat_histories').insert({ session_id: currentSessionId, role: 'assistant', content: botResponse.text }); } } catch {}
-        markCartUpdated(1000);
+        markCartUpdated(300);
       }
     } catch (e) {
       toast({ title: "Cart", description: "Could not update quantity" });
@@ -1481,7 +1517,7 @@ useEffect(() => {
       }
       if (data?.cart) {
         upsertCartMessage({ text: data?.output || `Removed ${line.product_name}.`, cart: data.cart });
-        markCartUpdated(1000);
+        markCartUpdated(300);
       } else {
         const botResponse: Message = {
           id: Date.now() + 1,
@@ -1492,7 +1528,7 @@ useEffect(() => {
         };
         setMessages((prev) => [...prev, botResponse]);
         try { if (supabase) { await (supabase as any).from('n8n_chat_histories').insert({ session_id: currentSessionId, role: 'assistant', content: botResponse.text }); } } catch {}
-        markCartUpdated(1000);
+        markCartUpdated(300);
       }
     } catch (e) {
       toast({ title: "Cart", description: "Could not remove item" });
@@ -1535,7 +1571,18 @@ useEffect(() => {
           <Card className="w-[25rem] h-[600px] shadow-2xl border-border bg-white">
             {/* Header */}
             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2 bg-black text-white rounded-t-lg">
-              <CardTitle className="text-sm font-medium">Customer Support</CardTitle>
+              <CardTitle className="text-sm font-medium flex items-center gap-2">
+                Customer Support
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={handleNewChatSession}
+                  className="h-6 px-2 text-black bg-white hover:bg-white/90 transition-all duration-150"
+                  title="Start a new chat"
+                >
+                  New chat
+                </Button>
+              </CardTitle>
               <div className="flex items-center gap-1">
                 <Button
                   variant="ghost"
