@@ -160,6 +160,7 @@ export default function CartPage() {
     setTotal(t => Math.max(0, t - bundleSavings))
     setShowBundleModal(false)
     setBundleAdding(false)
+    try { localStorage.setItem('cart_updated_at', Date.now().toString()); window.dispatchEvent(new CustomEvent('cart:updated')); } catch {}
   }
 
   return (

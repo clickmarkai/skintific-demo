@@ -141,6 +141,11 @@ All colors MUST be HSL.
   animation: ai-fade-in-char 0.35s ease forwards;
 }
 
+.ai-word {
+  display: inline-block;
+  white-space: nowrap;
+}
+
 /* Message bubble pop-in */
 @keyframes msg-pop-in {
   0% { opacity: 0; transform: translateY(4px) scale(0.98); }

@@ -131,18 +131,25 @@ const ChatWidget = () => {
     const count = Math.max(0, Math.min(aiCountsRef.current[id] ?? total, total));
     const visible = String(text || '').slice(0, count);
     const rest = String(text || '').slice(count);
-    const parts = visible.split('\n');
+    const lines = visible.split('\n');
     return (
       <span>
-        {parts.map((line, li) => (
+        {lines.map((line, li) => (
           <span key={`line-${li}`}>
-            {line.split('').map((ch, i) => (
-              <span key={`ch-${li}-${i}`} className="ai-fade-char">{ch}</span>
+            {line.split(/(\s+)/).map((token, wi) => (
+              token.trim().length === 0 ? (
+                <span key={`sp-${li}-${wi}`}>{token}</span>
+              ) : (
+                <span key={`w-${li}-${wi}`} className="ai-word">
+                  {token.split('').map((ch, ci) => (
+                    <span key={`ch-${li}-${wi}-${ci}`} className="ai-fade-char">{ch}</span>
+                  ))}
+                </span>
+              )
             ))}
-            {li < parts.length - 1 ? <br /> : null}
+            {li < lines.length - 1 ? <br /> : null}
           </span>
         ))}
-        {/* keep layout stable while typing */}
         {rest ? <span style={{ opacity: 0 }}>{rest}</span> : null}
       </span>
     );
@@ -252,6 +259,7 @@ const ChatWidget = () => {
   const [imgPreviewMounted, setImgPreviewMounted] = useState(false);
   const [imgAnim, setImgAnim] = useState<AnimPhase>(null);
   const lastCartHashRef = useRef<string | null>(null);
+  const suppressCartSyncUntilRef = useRef<number>(0);
 
   const calcCartHash = (cart: any): string => {
     try {
@@ -262,8 +270,9 @@ const ChatWidget = () => {
   };
 
   // Broadcast + listen for cross-tab/app cart updates for sync between chat and cart page
-  const markCartUpdated = () => {
+  const markCartUpdated = (suppressMs: number = 0) => {
     try {
+      if (suppressMs > 0) suppressCartSyncUntilRef.current = Date.now() + suppressMs;
       const ts = Date.now().toString();
       localStorage.setItem('cart_updated_at', ts);
       window.dispatchEvent(new CustomEvent('cart:updated', { detail: ts }));
@@ -272,6 +281,7 @@ const ChatWidget = () => {
 
   const refreshCartFromServer = async () => {
     try {
+      if (Date.now() < suppressCartSyncUntilRef.current) return;
       const currentSessionId = await getCurrentSessionId();
       let data: any = null;
       if (supabase) {
@@ -644,7 +654,10 @@ useEffect(() => {
   const shortId = (id: string) => id.replace(/-/g, "").toUpperCase().slice(0, 8);
 
   const getCurrentSessionId = async (): Promise<string> => {
-    // Keep the new ephemeral session for this browser load
+    try {
+      const ls = localStorage.getItem('chat_session_id');
+      if (ls && ls.length > 0) return ls;
+    } catch {}
     return sessionId;
   };
 
@@ -1023,7 +1036,7 @@ useEffect(() => {
           const { data: existingCarts, error: findErr } = await (supabase as any)
             .from('carts')
             .select('id')
-            .or(`user_id.eq.${user?.id || 'null'},session_id.eq.${currentSessionId}`)
+            .eq('session_id', currentSessionId)
             .eq('status', 'active')
             .order('created_at', { ascending: false })
             .limit(1);
@@ -1123,6 +1136,10 @@ useEffect(() => {
               voucher_code: null,
             },
           };
+          // Immediately reflect in UI without waiting for remote sync
+          upsertCartMessage({ text: 'Cart updated.', cart: data.cart });
+          // Don't immediately trigger remote refresh that could return an older snapshot
+          markCartUpdated(1500);
         } catch (clientPathErr) {
           // Fallback to edge function if direct path fails
           const { data: fnData, error: fnErr } = await (supabase as any).functions.invoke('chat', { body: payload });
@@ -1160,7 +1177,7 @@ useEffect(() => {
 
       if (data?.cart) {
         upsertCartMessage({ text: data?.output || `Cart updated.`, cart: data.cart });
-        markCartUpdated();
+        markCartUpdated(1000);
         // If backend provides upsell, render below as a products carousel with a short heading
         if (Array.isArray(data?.upsell) && data.upsell.length) {
           const upsellMsg: Message = {
@@ -1290,7 +1307,7 @@ useEffect(() => {
       }
       if (data?.cart) {
         upsertCartMessage({ text: data?.output || `Cart cleared.`, cart: data.cart });
-        markCartUpdated();
+        markCartUpdated(1000);
       } else {
         const botResponse: Message = {
           id: Date.now() + 1,
@@ -1402,7 +1419,7 @@ useEffect(() => {
       }
       if (data?.cart) {
         upsertCartMessage({ text: data?.output || `Updated ${line.product_name}.`, cart: data.cart });
-        markCartUpdated();
+        markCartUpdated(1000);
       } else {
         const botResponse: Message = {
           id: Date.now() + 1,
@@ -1413,7 +1430,7 @@ useEffect(() => {
         };
         setMessages((prev) => { const next = [...prev, botResponse]; playNotify(); return next; });
         try { if (supabase) { await (supabase as any).from('n8n_chat_histories').insert({ session_id: currentSessionId, role: 'assistant', content: botResponse.text }); } } catch {}
-        markCartUpdated();
+        markCartUpdated(1000);
       }
     } catch (e) {
       toast({ title: "Cart", description: "Could not update quantity" });
@@ -1464,7 +1481,7 @@ useEffect(() => {
       }
       if (data?.cart) {
         upsertCartMessage({ text: data?.output || `Removed ${line.product_name}.`, cart: data.cart });
-        markCartUpdated();
+        markCartUpdated(1000);
       } else {
         const botResponse: Message = {
           id: Date.now() + 1,
@@ -1475,7 +1492,7 @@ useEffect(() => {
         };
         setMessages((prev) => [...prev, botResponse]);
         try { if (supabase) { await (supabase as any).from('n8n_chat_histories').insert({ session_id: currentSessionId, role: 'assistant', content: botResponse.text }); } } catch {}
-        markCartUpdated();
+        markCartUpdated(1000);
       }
     } catch (e) {
       toast({ title: "Cart", description: "Could not remove item" });

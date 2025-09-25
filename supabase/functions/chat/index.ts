@@ -655,7 +655,18 @@ serve(async (req) => {
     // Clarifier de-duplication helpers
     function isClarifierAsk(text: string | undefined | null): boolean {
       const s = String(text || '');
-      return /to recommend the best fit, could you share/i.test(s) || /skin concerns.*(oily|acne|brightening|anti-?aging)/i.test(s);
+      return (
+        /to recommend the best fit, could you share/i.test(s) ||
+        /skin concerns?.*(oily|acne|brighten|anti-?aging|dry|sensitive)/i.test(s) ||
+        /what\s+(is|\w+)?\s*your\s*skin\s*type\b/i.test(s) ||
+        /what\s*skin\s*type\b/i.test(s) ||
+        /which\s*skin\s*type\b/i.test(s) ||
+        /what\s*(specific)?\s*skin\s*concern/i.test(s) ||
+        /price\s*range|budget/i.test(s) ||
+        /share\s*(the\s*)?(product|skincare)\s*type/i.test(s) ||
+        /help\s*me\s*(recommend|suggest)/i.test(s) ||
+        /help\s*narrow\s*down\s*the\s*best\s*(options|picks)/i.test(s)
+      );
     }
     async function clarifierAskedRecently(sessionId: string, windowMs = 4000): Promise<boolean> {
       try {
@@ -700,6 +711,62 @@ serve(async (req) => {
         const parsed = JSON.parse(data?.choices?.[0]?.message?.content || '{}');
         return Boolean(parsed.escalate);
       } catch (_) { return false; }
+    }
+
+    // LLM: Generate a short, context-aware clarifying question.
+    async function generateClarifierPrompt(historyMsgs: any[], missing: { type?: boolean; concerns?: boolean; budget?: boolean }, tagHint?: string): Promise<string | null> {
+      if (!OPENAI_API_KEY) return null;
+      try {
+        const wants: string[] = [];
+        if (missing?.type) wants.push('product type (e.g., serum, moisturizer, cleanser, sunscreen, toner)');
+        if (missing?.concerns) wants.push('skin concerns (e.g., oily, acne, brightening, anti-aging)');
+        if (missing?.budget) wants.push('budget range');
+        const askFor = wants.length ? wants.join(', ') : 'any specific details to tailor recommendations (type, concerns, budget)';
+        const lastUser = [...(historyMsgs||[])].reverse().find((m:any)=>m.role==='user');
+        const sys = 'You are a concise skincare shopping assistant. Write ONE short, friendly clarifying question tailored to the conversation. Ask ONLY for the missing details indicated. Avoid lists or multiple sentences.';
+        const userPrompt = `Missing: ${askFor}${tagHint ? `\nHints: ${tagHint}` : ''}${lastUser ? `\nLastUser: ${String(lastUser.content||'')}` : ''}`;
+        const body: any = { model: CHAT_MODEL, messages: [ { role: 'system', content: sys }, { role: 'user', content: userPrompt } ], temperature: 0.2, max_tokens: 60 };
+        const res = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_API_KEY}` }, body: JSON.stringify(body) });
+        if (!res.ok) return null;
+        const j = await res.json();
+        const text = j?.choices?.[0]?.message?.content?.trim();
+        return (typeof text === 'string' && text.length) ? text : null;
+      } catch { return null; }
+    }
+
+    // LLM: Did the user's latest message provide specific details requested by the previous clarifier?
+    async function llmIsFollowupSpecific(historyMsgs: any[], userMsg: string): Promise<boolean> {
+      if (!OPENAI_API_KEY) return false;
+      try {
+        const lastAssistant = [...(historyMsgs || [])].reverse().find((m: any) => m.role === 'assistant');
+        const lastAssistantText = String(lastAssistant?.content || '');
+        const sys = 'Return JSON {"specific": boolean}. specific=true if the USER message supplies concrete details asked by the previous assistant question (e.g., product type, skin concerns, budget).';
+        const bodyLLM: any = { model: CHAT_MODEL, messages: [
+          { role: 'system', content: sys },
+          { role: 'user', content: `PreviousAssistant: ${lastAssistantText}\nUser: ${userMsg}` }
+        ], temperature: 0, response_format: { type: 'json_object' } };
+        const res = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_API_KEY}` }, body: JSON.stringify(bodyLLM) });
+        const data = await res.json();
+        const parsed = JSON.parse(data?.choices?.[0]?.message?.content || '{}');
+        return Boolean(parsed?.specific === true);
+      } catch { return false; }
+    }
+
+    // LLM: Is this message about product recommendation intent?
+    async function llmIsProductIntent(historyMsgs: any[], userMsg: string): Promise<boolean> {
+      if (!OPENAI_API_KEY) return false;
+      try {
+        const sys = 'Return JSON {"product_intent": boolean}. Consider the conversation. product_intent=true if the user is seeking product suggestions or discussing skincare products to buy or use.';
+        const bodyLLM: any = { model: CHAT_MODEL, messages: [
+          { role: 'system', content: sys },
+          ...historyMsgs.slice(-6),
+          { role: 'user', content: userMsg }
+        ], temperature: 0, response_format: { type: 'json_object' } };
+        const res = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_API_KEY}` }, body: JSON.stringify(bodyLLM) });
+        const data = await res.json();
+        const parsed = JSON.parse(data?.choices?.[0]?.message?.content || '{}');
+        return Boolean(parsed?.product_intent === true);
+      } catch { return false; }
     }
     // Escalate only for conversational/general flow
     if (intent === 'general') {
@@ -793,9 +860,9 @@ serve(async (req) => {
         // Clear ALL active carts tied to this session
         try {
           const { data: bySession } = await supabaseSrv
-            .from('carts')
-            .select('id')
-            .eq('status', 'active')
+          .from('carts')
+          .select('id')
+          .eq('status', 'active')
             .eq('session_id', sessionId);
           for (const r of bySession || []) {
             if (r?.id && !cartIds.includes(r.id)) cartIds.push(r.id);
@@ -828,14 +895,14 @@ serve(async (req) => {
               .in('id', cartIds as any);
           } catch {}
         }
-
+        
         const output = "Cart cleared.";
         await logEvent(supabaseSrv, sessionId, body.user_id, 'user', message || 'clear cart');
         await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', output);
-
+        
         return new Response(
-          JSON.stringify({
-            output,
+          JSON.stringify({ 
+            output, 
             cart: { items: [], subtotal_cents: 0, discount_cents: 0, total_cents: 0, voucher_code: null },
             returnCart: true
           }),
@@ -844,7 +911,7 @@ serve(async (req) => {
       } catch (error) {
         console.error('delete_cart error:', error);
       }
-
+      
       return new Response(
         JSON.stringify({ output: "Cart cleared.", cart: { items: [], subtotal_cents: 0, discount_cents: 0, total_cents: 0, voucher_code: null } }),
         { headers }
@@ -1214,7 +1281,9 @@ serve(async (req) => {
       // Narrower detection so non-product questions (e.g., "how many categories ...") don't trigger
       const typeOrConcern = /(moistur|serum|cleanser|sunscreen|toner|mask|spf|acne|oily|dry|sensitive|brighten|brightening|hyperpig|wrinkle|aging|anti-?aging|dark\s?spots?|blemish|pores?|blackheads?|whiteheads?|oil\s?control)/i;
       const buyOrRecommend = /(recommend|suggest|show\b|need|want|looking\s*for|buy|price|budget)/i;
-      const looksLikeProductQuery = typeOrConcern.test(message) || buyOrRecommend.test(message);
+      let looksLikeProductQuery = typeOrConcern.test(message) || buyOrRecommend.test(message);
+      // Use LLM to judge product intent to avoid rigid keyword behavior
+      try { if (!looksLikeProductQuery) { looksLikeProductQuery = await llmIsProductIntent(history, message); } } catch {}
       const askedClarifierRecentlyLocal = [...history]
         .reverse()
         .slice(0, 6)
@@ -1227,7 +1296,20 @@ serve(async (req) => {
         try {
           const duplicateClarifier = await clarifierAskedRecently(sessionId, 5000);
           const judge = duplicateClarifier ? null : await judgeSpecificityLLM(history, message);
-          if (judge && judge.specific === false) {
+          // If user already provided at least product type OR a concern, don't block on clarifier; proceed to results
+          let hasCoreNeeds = false;
+          try {
+            const quickNeeds = await extractNeeds(message, history);
+            hasCoreNeeds = Boolean(quickNeeds?.product_type) || ((quickNeeds?.concerns || []).length > 0);
+          } catch {}
+          // If previous turn was a clarifier and LLM says this message provides specifics, skip clarifier and proceed
+          try {
+            if (!hasCoreNeeds) {
+              const provided = await llmIsFollowupSpecific(history, message);
+              if (provided) hasCoreNeeds = true;
+            }
+          } catch {}
+          if (judge && judge.specific === false && !hasCoreNeeds) {
             shouldAskClarifier = true;
             const wantType = judge?.missing?.product_type;
             const wantConcerns = judge?.missing?.concerns;
@@ -1248,7 +1330,8 @@ serve(async (req) => {
             const typeOnly = /(\bserum\b|moisturizer|moisturiser|cleanser|face\s*wash|sunscreen|\bspf\b|toner|mask|make\s?up|makeup)\b/i.test(lower);
             const hasConcern = /(acne|oily|dry|sensitive|brighten|dark\s*spots?|aging|wrinkle|pore|blackheads?|whiteheads?|hydrating|soothing|calming|barrier|redness)/i.test(lower);
             const hasBudget = /(under|below|budget|idr|rp|usd|price|affordable|expensive|\$\s?\d+|\d+\s?(k|rb|ribu))/i.test(lower);
-            if (typeOnly && (!hasConcern || !hasBudget)) {
+            // Only ask again if the user provided NONE of type or concerns.
+            if (!hasConcern && !typeOnly) {
               const ask = 'To recommend the best fit, could you share your skin concerns (e.g., oily, acne, brightening, anti-aging) and your budget range?';
               await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', ask);
               return new Response(JSON.stringify({ output: ask, debug: { backend: 'supabase', stage: 'clarifier_fallback' } }), { headers });
@@ -1317,20 +1400,50 @@ serve(async (req) => {
           } catch {}
           const duplicateClarifier3 = await clarifierAskedRecently(sessionId, 5000);
           if (!duplicateClarifier3 && !userProvidedAnySpecifics(message)) {
-            const ask = `To recommend the best fit, could you share the product type (moisturizer, serum, cleanser, sunscreen, toner), your skin concerns (e.g., oily, acne, brightening), and a price range?${tagHint}`;
+            const dynAsk = await generateClarifierPrompt(history, { type: true, concerns: true, budget: true }, tagHint);
+            const ask = dynAsk || `To recommend the best fit, could you share the product type (moisturizer, serum, cleanser, sunscreen, toner), your skin concerns (e.g., oily, acne, brightening), and a price range?${tagHint}`;
             await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', ask);
-            return new Response(JSON.stringify({ output: ask, debug: { backend: 'supabase', stage: 'clarifier_first' } }), { headers });
+            return new Response(JSON.stringify({ output: ask, debug: { backend: 'supabase', stage: 'clarifier_first_dyn' } }), { headers });
           }
         }
 
-        // Weak matches: if top score is likely low (heuristic) → ask 1 follow-up instead
-        // We infer score by recomputing quickly
-        // If we have at least one product, prefer returning products rather than another tip
+        // If we have any products here but we have NOT yet received a user reply after a clarifier within the last 8s, wait.
+        try {
+          const askedRecently = await clarifierAskedRecently(sessionId, 8000);
+          // However, if this user message is judged by LLM as a specific follow-up to that clarifier, proceed immediately
+          const provided = await llmIsFollowupSpecific(history, message);
+          if (askedRecently && !provided) {
+            const tip = 'I’ll wait for your details to tailor the best picks.';
+            await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', tip);
+            return new Response(JSON.stringify({ output: tip, debug: { backend: 'supabase', stage: 'await_after_clarifier_window' } }), { headers });
+          }
+        } catch {}
 
-        // If we have matches, return them with a concise reply
+        // If the LLM draft itself is a clarifier question, do NOT attach products. Wait for user reply.
+        try {
+          if (draft && isClarifierAsk(String(draft))) {
+            const askOnly = String(draft);
+            await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', askOnly);
+            return new Response(JSON.stringify({ output: askOnly, debug: { backend: 'supabase', stage: 'clarifier_draft_only' } }), { headers });
+          }
+        } catch {}
+
+        // If we have matches and the last assistant turn was a clarifier we asked, do NOT auto-send products.
+        // Wait for the user's next message instead.
+        try {
+          const lastAssistant = [...history].reverse().find((m: any) => m.role === 'assistant');
+          const lastWasClarifier = lastAssistant && isClarifierAsk(String(lastAssistant.content || ''));
+          // Allow products only if the current message is a specific follow-up
+          const provided = await llmIsFollowupSpecific(history, message);
+          if (lastWasClarifier && !provided) {
+            const tip = 'Thanks! I’ll wait for your details to tailor the best picks.';
+            await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', tip);
+            return new Response(JSON.stringify({ output: tip, debug: { backend: 'supabase', stage: 'await_clarifier_reply' } }), { headers });
+          }
+        } catch {}
+        // Otherwise, return matches with a concise reply
         const reply = draft || 'Here are some recommendations based on your needs:';
         await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', reply);
-        // Note: Frontend persists structured products; avoid duplicate DB insert here
         return new Response(JSON.stringify({ output: reply, products, debug: { backend: 'supabase', stage: 'products' } }), { headers });
       }
       // Escalate based on the LLM draft only (no keywords)
