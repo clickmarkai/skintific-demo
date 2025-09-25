@@ -778,14 +778,22 @@ serve(async (req) => {
 
     if (intent === "get_cart_info") {
       try {
-        const { data: ensured } = await supabaseSrv.rpc('ensure_cart', { 
+        let cartId: string | null = null;
+        const { data: ensured, error: ensureErr } = await supabaseSrv.rpc('ensure_cart', { 
           p_currency: 'IDR', 
           p_session_id: sessionId, 
-          p_user_id: body.user_id || null 
+          p_user_id: null 
         });
-        
-        if (ensured?.id) {
-          const cart = await fetchCartItems(ensured.id, 'IDR');
+        cartId = ensured?.id || null;
+        if (!cartId && (ensureErr as any)?.code === '23505') {
+          const { data: existing } = await supabaseSrv
+            .from('carts').select('id').eq('status','active')
+            .eq('session_id', sessionId)
+            .order('created_at', { ascending: false }).limit(1).maybeSingle();
+          cartId = existing?.id || null;
+        }
+        if (cartId) {
+          const cart = await fetchCartItems(cartId, 'IDR');
           const output = cart.items.length === 0 
             ? "Your cart is empty."
             : `Your cart has ${cart.items.length} item${cart.items.length > 1 ? 's' : ''}.`;
@@ -795,7 +803,7 @@ serve(async (req) => {
           
           // Compute bundle suggestions for modal on cart page
           let bundles: any[] = [];
-          try { bundles = await computeBundleUpsell(cart, ensured.id); } catch {}
+          try { bundles = await computeBundleUpsell(cart, cartId); } catch {}
           return new Response(
             JSON.stringify({ output, cart, returnCart: true, bundles }),
             { headers }
@@ -813,40 +821,29 @@ serve(async (req) => {
 
     if (intent === "get_upsell") {
       try {
-        const { data: ensured } = await supabaseSrv.rpc('ensure_cart', {
+        let cartId: string | null = null;
+        const { data: ensured, error: ensureErr } = await supabaseSrv.rpc('ensure_cart', {
           p_currency: 'IDR',
           p_session_id: sessionId,
-          p_user_id: body.user_id || null,
+          p_user_id: null,
         });
-        const cartId = ensured?.id;
+        cartId = ensured?.id || null;
+        if (!cartId && (ensureErr as any)?.code === '23505') {
+          const { data: existing } = await supabaseSrv
+            .from('carts').select('id').eq('status','active')
+            .eq('session_id', sessionId)
+            .order('created_at', { ascending: false }).limit(1).maybeSingle();
+          cartId = existing?.id || null;
+        }
         if (cartId) {
           const cart = await fetchCartItems(cartId, 'IDR');
-          // Do not return upsell/bundles when the cart is empty
           if (!Array.isArray(cart.items) || cart.items.length === 0) {
             return new Response(JSON.stringify({ output: '', upsell: [], bundles: [] }), { headers });
           }
-          let upsell: any[] = [];
           let bundles: any[] = [];
-          try {
-            const cartCats = await getCartCategories(supabaseSrv, cartId);
-            const wanted = complementaryCategories(cartCats);
-            if (wanted.length) {
-              const q = wanted.join(' ');
-              let candidates = await searchProductsSmart(q, 8);
-              const inCartIds = new Set<string>(
-                (cart.items || [])
-                  .map((i: any) => [String(i.variant_id || ''), String(i.product_id || '')])
-                  .flat()
-                  .filter(Boolean)
-              );
-              upsell = (candidates || []).filter((p: any) => !inCartIds.has(String(p.variant_id || p.id || ''))).slice(0, 4);
-              upsell = applyUpsellDiscount(upsell, 10);
-            }
-          } catch {}
           try { bundles = await computeBundleUpsell(cart, cartId); } catch {}
-          const output = (upsell.length || bundles.length) ? 'You may also like these to complete your routine:' : '';
-          if (output) await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', output);
-          return new Response(JSON.stringify({ output, upsell, bundles }), { headers });
+          // Disable upsell text/messages in chat; only provide bundles for popup
+          return new Response(JSON.stringify({ output: '', upsell: [], bundles }), { headers });
         }
       } catch (e) {
         console.error('get_upsell error:', e);
@@ -922,13 +919,21 @@ serve(async (req) => {
       try {
         const items = Array.isArray((body as any)?.items) ? (body as any).items : [];
         const discountPercent = Number((body as any)?.discount_percent || 10);
-        const { data: ensured } = await supabaseSrv.rpc('ensure_cart', { 
+        let cartId: string | null = null;
+        const { data: ensured, error: ensureErr } = await supabaseSrv.rpc('ensure_cart', { 
           p_currency: 'IDR', 
           p_session_id: sessionId, 
-          p_user_id: body.user_id || null 
+          p_user_id: null 
         });
-        if (!ensured?.id) return new Response(JSON.stringify({ error: 'Cart unavailable' }), { status: 500, headers });
-        const cartId = ensured.id;
+        cartId = ensured?.id || null;
+        if (!cartId && (ensureErr as any)?.code === '23505') {
+          const { data: existing } = await supabaseSrv
+            .from('carts').select('id').eq('status','active')
+            .eq('session_id', sessionId)
+            .order('created_at', { ascending: false }).limit(1).maybeSingle();
+          cartId = existing?.id || null;
+        }
+        if (!cartId) return new Response(JSON.stringify({ error: 'Cart unavailable' }), { status: 500, headers });
 
         // Build a set of existing product ids/variant ids to dedupe
         const { data: existingLines } = await supabaseSrv
@@ -1037,7 +1042,7 @@ serve(async (req) => {
         const { data: ensured, error: ensureErr } = await supabaseSrv.rpc('ensure_cart', { 
           p_currency: 'IDR', 
           p_session_id: sessionId, 
-          p_user_id: body.user_id || null 
+          p_user_id: null 
         });
         
         if (ensureErr || !ensured?.id) {
@@ -1143,7 +1148,7 @@ serve(async (req) => {
         const { data: ensured } = await supabaseSrv.rpc('ensure_cart', { 
           p_currency: 'IDR', 
           p_session_id: sessionId, 
-          p_user_id: body.user_id || null 
+          p_user_id: null 
         });
         
         if (ensured?.id) {

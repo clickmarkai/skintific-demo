@@ -540,7 +540,7 @@ useEffect(() => {
 				<div className="absolute inset-0 p-4 md:p-8 overflow-auto flex items-center justify-center">
 					<div className={`w-full max-w-3xl md:max-w-4xl bg-white rounded-2xl shadow-2xl border border-black/10 min-sh-[510px] flex flex-col transform transition-all duration-300 ${bundleAnim === 'in' ? 'opacity-100 translate-y-0 scale-100' : 'opacity-0 translate-y-2 scale-95'}`}>
             <div className="flex items-center justify-between px-5 py-4 rounded-t-2xl bg-gradient-to-r from-black to-gray-800 text-white">
-              <div className="text-lg font-semibold">Bundle and save 10%</div>
+              <div className="text-lg font-semibold">Special bundle offer</div>
 							<Button variant="ghost" size="sm" className="text-white hover:bg-white/10" onClick={closeBundleModal}>Close</Button>
             </div>
             <div className="p-5 flex-1 overflow-auto">
@@ -1198,7 +1198,7 @@ useEffect(() => {
         if (Array.isArray((data as any)?.bundles) && (data as any).bundles.length) {
           const bundleMsg: Message = {
             id: Date.now() + 3,
-            text: 'Bundle and save more:',
+            text: '',
             isUser: false,
             timestamp: new Date(),
             kind: 'bundles',
@@ -1224,7 +1224,7 @@ useEffect(() => {
               try { await (supabase as any).from('n8n_chat_histories').insert({ session_id: currentSessionId, message: { role: 'assistant', content: upsellMsg.text, kind: 'products', products: upsellData.upsell } }); } catch {}
             }
             if (upsellData && Array.isArray((upsellData as any).bundles) && (upsellData as any).bundles.length) {
-              const bundleMsg: Message = { id: Date.now() + 6, text: upsellData.output || 'Bundle and save more:', isUser: false, timestamp: new Date(), kind: 'bundles', bundles: (upsellData as any).bundles } as any;
+              const bundleMsg: Message = { id: Date.now() + 6, text: '', isUser: false, timestamp: new Date(), kind: 'bundles', bundles: (upsellData as any).bundles } as any;
               setMessages((prev) => [...prev, bundleMsg]);
               try { if (supabase) { await (supabase as any).from('n8n_chat_histories').insert({ session_id: currentSessionId, message: { role: 'assistant', content: bundleMsg.text, kind: 'bundles', bundles: (upsellData as any).bundles } }); } } catch {}
             }
@@ -1241,7 +1241,7 @@ useEffect(() => {
                 setMessages((prev) => [...prev, upsellMsg]);
               }
               if (upsellData && Array.isArray((upsellData as any).bundles) && (upsellData as any).bundles.length) {
-                const bundleMsg: Message = { id: Date.now() + 6, text: 'Bundle and save more:', isUser: false, timestamp: new Date(), kind: 'bundles', bundles: (upsellData as any).bundles } as any;
+                const bundleMsg: Message = { id: Date.now() + 6, text: '', isUser: false, timestamp: new Date(), kind: 'bundles', bundles: (upsellData as any).bundles } as any;
                 setMessages((prev) => [...prev, bundleMsg]);
               }
             }
