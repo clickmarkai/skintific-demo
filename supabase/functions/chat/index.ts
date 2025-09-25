@@ -579,7 +579,7 @@ serve(async (req) => {
           console.error('Ticket webhook error', e);
         }
         
-        const output = `I've created a support ticket so a human can assist you shortly. Subject: ${(message || 'Customer support request').slice(0, 80)}.`;
+        const output = `I've created a support ticket so a human can assist you shortly, please kindly check your email. Subject: ${(message || 'Customer support request').slice(0, 80)}.`;
         await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', output);
         return new Response(JSON.stringify({ output, ticket_created: true }), { headers });
       }
