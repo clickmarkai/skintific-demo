@@ -86,7 +86,7 @@ const ChatWidget = () => {
       localStorage.setItem('chat_session_id', fresh);
       return fresh;
     } catch {
-      return crypto.randomUUID();
+    return crypto.randomUUID();
     }
   });
   const [isMinimized, setIsMinimized] = useState(() => {
@@ -1447,16 +1447,16 @@ const ChatWidget = () => {
                                             onError={(e) => { (e.currentTarget as HTMLImageElement).src = '/placeholder.svg'; }}
                                           />
                                         )}
-                                        <div className="font-semibold leading-tight line-clamp-2">{p.name}</div>
-                                        <div className="text-xs text-gray-600">{p.price_cents != null ? formatCurrency(p.price_cents) : (p.price != null ? `$${p.price.toFixed(2)}` : "")}</div>
-                                        {p.tags && p.tags.length > 0 && (
-                                          <div className="mt-1 flex flex-wrap gap-1">
-                                            {p.tags.slice(0, 3).map((t, i) => (
-                                              <span key={i} className="px-2 py-0.5 rounded-full bg-gray-200 text-gray-700 text-[10px]">{t}</span>
-                                            ))}
-                                          </div>
-                                        )}
-                                      </div>
+                                          <div className="font-semibold leading-tight line-clamp-2">{p.name}</div>
+                                          <div className="text-xs text-gray-600">{p.price_cents != null ? formatCurrency(p.price_cents) : (p.price != null ? `$${p.price.toFixed(2)}` : "")}</div>
+                                          {p.tags && p.tags.length > 0 && (
+                                            <div className="mt-1 flex flex-wrap gap-1">
+                                              {p.tags.slice(0, 3).map((t, i) => (
+                                                <span key={i} className="px-2 py-0.5 rounded-full bg-gray-200 text-gray-700 text-[10px]">{t}</span>
+                                              ))}
+                                            </div>
+                                          )}
+                                        </div>
                                       {(p.description || (p.benefits && p.benefits.length > 0)) && (
                                         <div className="mt-2 text-xs text-gray-700">
                                           {p.description ? (
@@ -1464,7 +1464,7 @@ const ChatWidget = () => {
                                           ) : (
                                             <ul className="list-disc ml-4">
                                               {p.benefits!.slice(0, 3).map((b, i) => (<li key={i}>{b}</li>))}
-                                            </ul>
+                                        </ul>
                                           )}
                                         </div>
                                       )}
@@ -1584,7 +1584,7 @@ const ChatWidget = () => {
                                           </Button>
                                         </div>
                                       </div>
-                                  <div className="text-sm font-medium text-gray-700">
+                                      <div className="text-sm font-medium text-gray-700">
                                         {formatCurrency((it.unit_price_cents || 0) * (it.qty || 0))}
                                       </div>
                                     </div>

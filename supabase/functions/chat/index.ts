@@ -1,7 +1,7 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.43.2';
 
-const VITE_OPENAI_API_KEY = Deno.env.get('VITE_OPENAI_API_KEY');
+const OPENAI_API_KEY = Deno.env.get('OPENAI_API_KEY');
 const CHAT_MODEL = Deno.env.get('CHAT_MODEL') || 'gpt-4o-mini';
 
 interface LineItem {
@@ -26,23 +26,26 @@ const currency = (cents: number) => `$${(cents / 100).toFixed(2)}`;
 
 const detectIntent = (message: string): string => {
   const lower = message.toLowerCase();
-  if (/\b(add|want|need|buy|get me|purchase)\b/.test(lower) && !/\b(remove|delete|cancel)\b/.test(lower)) return "add_line";
+  // Add to cart only when explicitly asked to add/put into cart or clear buy intent
+  const addToCart = /(add|put|insert)\b[\s\S]*\b(cart|bag)\b/.test(lower) || /\badd to (cart|bag)\b/.test(lower);
+  const buyDirect = /\b(buy now|purchase now|proceed to checkout)\b/.test(lower);
+  if ((addToCart || buyDirect) && !/\b(remove|delete|cancel)\b/.test(lower)) return "add_line";
   if (/\b(change|update|modify|set|edit)\s+(qty|quantity)\b/.test(lower)) return "edit_line";
   if (/\b(remove|delete|cancel|take out)\b/.test(lower)) return "delete_line";
   if (/\b(clear|empty|reset)\s+(cart|bag)\b/.test(lower)) return "delete_cart";
   if (/\b(cart|bag|total|summary|order)\b/.test(lower) && /\b(show|view|check|what|see|look)\b/.test(lower)) return "get_cart_info";
   if (/\b(voucher|coupon|discount|promo|code|apply)\b/.test(lower)) return "apply_voucher";
-  if (/\b(checkout|pay|purchase|buy now|complete order)\b/.test(lower)) return "checkout";
+  if (/\b(checkout|pay|complete order)\b/.test(lower)) return "checkout";
   if (/\b(help|support|issue|problem|complaint|refund|return)\b/.test(lower)) return "ticket";
-  if (/\b(hi|hello|hey|recommend|suggest|product|moisturi|serum|cleanser|sunscreen|toner|skincare)\b/.test(lower)) return "general";
+  // Default conversational/product path ("need", "want" etc. are treated as product queries, not add-to-cart)
   return "general";
 };
 
 const fetchCartItems = async (cartId: string, currency: string = 'IDR'): Promise<Cart> => {
   try {
     const supabase = createClient(
-      Deno.env.get('VITE_SUPABASE_URL')!,
-      Deno.env.get('VITE_SUPABASE_SERVICE_ROLE_KEY')!
+      Deno.env.get('SUPABASE_URL')!,
+      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
     );
 
     const { data: lines, error: linesErr } = await supabase
@@ -86,10 +89,7 @@ const logEvent = async (supabase: any, sessionId: string, userId: string | null,
       event_type: 'message',
       metadata: { role, content },
     });
-    // Persist to n8n chat history table
-    try {
-      await supabase.from('n8n_chat_histories').insert({ session_id: sessionId, message: { role, content } });
-    } catch {}
+    // IMPORTANT: Do not write to n8n_chat_histories here to avoid duplicates on refresh.
   } catch (error) {
     console.error('Error logging event:', error);
   }
@@ -113,8 +113,8 @@ serve(async (req) => {
     let intent = hintedIntent || detectIntent(message);
 
     const supabaseSrv = createClient(
-      Deno.env.get('VITE_SUPABASE_URL')!,
-      Deno.env.get('VITE_SUPABASE_SERVICE_ROLE_KEY')!
+      Deno.env.get('SUPABASE_URL')!,
+      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
     );
 
     // Prefer n8n_chat_histories for conversation history, fallback to events(metadata)
@@ -146,11 +146,11 @@ serve(async (req) => {
 
     // --- Helper: product search (vector first, fallback keyword) ---
     async function vectorSearchProducts(query: string, limit = 6, threshold = 0.25) {
-      if (!VITE_OPENAI_API_KEY) return [] as Array<any>;
+      if (!OPENAI_API_KEY) return [] as Array<any>;
       try {
         const embedRes = await fetch('https://api.openai.com/v1/embeddings', {
           method: 'POST',
-          headers: { 'Authorization': `Bearer ${VITE_OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+          headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({ model: 'text-embedding-3-small', input: query })
         });
         if (!embedRes.ok) return [];
@@ -318,6 +318,9 @@ serve(async (req) => {
 
     async function computeBundleUpsell(cart: any, cartId: string): Promise<any[]> {
       try {
+        // Do not suggest bundles if the cart is empty
+        const hasItems = Array.isArray(cart?.items) && cart.items.length > 0;
+        if (!hasItems) return [];
         // Strategy: find bundles whose items intersect with complementary categories of the cart
         const cartCats = await getCartCategories(supabaseSrv, cartId);
         const wanted = complementaryCategories(cartCats);
@@ -412,11 +415,27 @@ serve(async (req) => {
               price_cents: Math.round(Number(price) * 100),
               image_url: img || undefined,
               variant_id: md.variant_id || row.variant_id || row.id,
+              categories: extractCategoriesFromProductRow(row),
             };
           })
           .filter((p: any) => !inCartIds.has(String(p.id)) && String(p.name || '').toLowerCase() !== String(anchor.name || '').toLowerCase());
 
-          const others = candidates.slice(0, 2);
+          // Ensure additional items are from categories NOT in the cart and with no duplicates among themselves
+          const cartCatSet = new Set<string>((cartCats || []).map((c: any) => String(c)));
+          const eligible = (candidates || []).filter((p: any) => Array.isArray(p.categories) && p.categories.some((c: any) => !cartCatSet.has(String(c))));
+          const shuffled = [...eligible].sort(() => Math.random() - 0.5);
+          const usedCats = new Set<string>(Array.from(cartCatSet));
+          const picked: any[] = [];
+          for (const p of shuffled) {
+            const cats = (p.categories || []).map((c: any) => String(c));
+            const cat = cats.find((c: string) => !usedCats.has(c));
+            if (!cat) continue;
+            usedCats.add(cat);
+            picked.push(p);
+            if (picked.length >= 2) break;
+          }
+
+          const others = picked;
           if (!others.length) return [];
 
           const items = [anchor, ...others].slice(0, 3).map((p) => ({ id: p.id, variant_id: p.variant_id, name: p.name, price_cents: p.price_cents, image_url: p.image_url }));
@@ -455,17 +474,43 @@ serve(async (req) => {
 
     // Needs extraction via LLM (product_type, concerns, price_tier)
     async function extractNeeds(query: string, history: Array<any>) {
-      if (!VITE_OPENAI_API_KEY) return {} as any;
+      if (!OPENAI_API_KEY) return {} as any;
       try {
         const sys = "Extract product recommendation needs. Reply JSON {product_type?:string, concerns?:string[], price_tier?:string}. Product types include: moisturizer, serum, cleanser, sunscreen, toner, mask, makeup.";
         const res = await fetch('https://api.openai.com/v1/chat/completions', {
-          method: 'POST', headers: { 'Authorization': `Bearer ${VITE_OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+          method: 'POST', headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({ model: CHAT_MODEL, messages: [{ role: 'system', content: sys }, ...history.slice(-6), { role: 'user', content: query }], temperature: 0, response_format: { type: 'json_object' } })
         });
         const data = await res.json().catch(()=>({}));
         const parsed = JSON.parse(data?.choices?.[0]?.message?.content || '{}');
         return parsed || {};
       } catch { return {} as any; }
+    }
+
+    // Ask the LLM to judge if we have enough specifics to recommend products.
+    // Uses chat history to account for previously provided details.
+    async function judgeSpecificityLLM(history: Array<{ role: string; content: string }>, lastUser: string): Promise<{ specific: boolean; missing?: { product_type?: boolean; concerns?: boolean; budget?: boolean }; reason?: string } | null> {
+      if (!OPENAI_API_KEY) return null;
+      try {
+        const system = {
+          role: 'system',
+          content:
+            'You decide if there is enough information to recommend concrete shopping products. Return ONLY strict JSON: {"specific": boolean, "missing": {"product_type"?: boolean, "concerns"?: boolean, "budget"?: boolean}}.\nDefinition of specific: true only if, considering the last 10 turns, the user provided (a) a concrete product type or item/category AND (b) at least one explicit skin need/concern (e.g., oily, acne, brightening, dark spots, anti-aging, sensitive, pores, hydrating, barrier, redness). Budget is optional but mark missing if absent.\nIf concerns are absent in both history and the last message, you MUST set specific=false with missing.concerns=true. Be deterministic.'
+        } as any;
+        const messages: any[] = [system, ...history.slice(-10), { role: 'user', content: lastUser }];
+        const res = await fetch('https://api.openai.com/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: CHAT_MODEL, messages, temperature: 0, response_format: { type: 'json_object' } })
+        });
+        if (!res.ok) return null;
+        const data = await res.json().catch(() => ({}));
+        const parsed = JSON.parse(data?.choices?.[0]?.message?.content || '{}');
+        if (typeof parsed?.specific === 'boolean') {
+          return parsed as any;
+        }
+      } catch {}
+      return null;
     }
 
     function priceBucket(priceCents: number | undefined): 'budget' | 'mid' | 'premium' | undefined {
@@ -511,6 +556,14 @@ serve(async (req) => {
 
     async function persistHistoryStructured(sessionId: string, message: any) {
       try { await (supabaseSrv as any).from('n8n_chat_histories').insert({ session_id: sessionId, message }); } catch {}
+    }
+
+    function hasConcern(text: string): boolean {
+      return /(acne|oily|dry|combination|sensitive|redness|irritat|brighten|brightening|hyperpig|dark\s*spots?|blemish|wrinkle|aging|anti-?aging|firm|pore|pores|blackheads?|whiteheads?|hydrating|moisturizing|soothing|calming|repair|barrier)/i.test(String(text || ''));
+    }
+
+    function hasProductTypeText(text: string): boolean {
+      return /(moisturizer|moisturiser|serum|cleanser|face\s*wash|sunscreen|\bspf\b|toner|mask|make\s*up|makeup|foundation|cushion|powder|concealer|lipstick|mascara|eyeliner|brow|blush|bronzer|highlighter|primer|setting\s*spray|palette)/i.test(String(text || ''));
     }
 
     function inferProductTypeFromHistory(history: Array<{ role: string; content: string }>): string | undefined {
@@ -599,14 +652,48 @@ serve(async (req) => {
       return Array.from(new Set(out));
     }
 
+    // Clarifier de-duplication helpers
+    function isClarifierAsk(text: string | undefined | null): boolean {
+      const s = String(text || '');
+      return /to recommend the best fit, could you share/i.test(s) || /skin concerns.*(oily|acne|brightening|anti-?aging)/i.test(s);
+    }
+    async function clarifierAskedRecently(sessionId: string, windowMs = 4000): Promise<boolean> {
+      try {
+        const since = Date.now() - windowMs;
+        const { data } = await (supabaseSrv as any)
+          .from('events')
+          .select('metadata, created_at')
+          .eq('session_id', sessionId)
+          .eq('event_type', 'message')
+          .order('created_at', { ascending: false })
+          .limit(5);
+        for (const r of data || []) {
+          const ts = new Date(r.created_at).getTime();
+          if (ts < since) break;
+          const role = r?.metadata?.role;
+          const content = r?.metadata?.content;
+          if (role === 'assistant' && isClarifierAsk(content)) return true;
+        }
+      } catch {}
+      return false;
+    }
+
+    function userProvidedAnySpecifics(text: string): boolean {
+      const t = String(text || '').toLowerCase();
+      const hasType = hasProductTypeText(t);
+      const hasConc = hasConcern(t);
+      const hasBudget = /(under|below|budget|idr|rp|usd|price|affordable|expensive|\$\s?\d+|\d+\s?(k|rb|ribu))/i.test(t);
+      return Boolean(hasType || hasConc || hasBudget);
+    }
+
     // Escalate using LLM classification only (no regex gates)
     async function classifyNeedsHumanLLM(msg: string): Promise<boolean> {
-      if (!VITE_OPENAI_API_KEY) return false;
+      if (!OPENAI_API_KEY) return false;
       try {
         const sys = "Decide if this user request should be escalated to a human agent. Reply with pure JSON: { escalate: boolean }. Escalate if it concerns payment problems, billing, refunds, duplicate charges, missing confirmations/emails, account security, or anything requiring manual intervention beyond product recommendations, vouchers, cart or pricing.";
         const res = await fetch('https://api.openai.com/v1/chat/completions', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${VITE_OPENAI_API_KEY}` },
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_API_KEY}` },
           body: JSON.stringify({ model: CHAT_MODEL, messages: [{ role: 'system', content: sys }, { role: 'user', content: msg }], temperature: 0, response_format: { type: 'json_object' } })
         });
         const data = await res.json();
@@ -667,6 +754,10 @@ serve(async (req) => {
         const cartId = ensured?.id;
         if (cartId) {
           const cart = await fetchCartItems(cartId, 'IDR');
+          // Do not return upsell/bundles when the cart is empty
+          if (!Array.isArray(cart.items) || cart.items.length === 0) {
+            return new Response(JSON.stringify({ output: '', upsell: [], bundles: [] }), { headers });
+          }
           let upsell: any[] = [];
           let bundles: any[] = [];
           try {
@@ -698,27 +789,53 @@ serve(async (req) => {
 
     if (intent === "delete_cart") {
       try {
-        const { data: cartData } = await supabaseSrv
-          .from('carts')
-          .select('id')
-          .or(`session_id.eq.${sessionId},user_id.eq.${body.user_id || 'null'}`)
-          .eq('status', 'active')
-          .single();
-        
-        if (cartData?.id) {
+        const cartIds: string[] = [];
+        // Clear ALL active carts tied to this session
+        try {
+          const { data: bySession } = await supabaseSrv
+            .from('carts')
+            .select('id')
+            .eq('status', 'active')
+            .eq('session_id', sessionId);
+          for (const r of bySession || []) {
+            if (r?.id && !cartIds.includes(r.id)) cartIds.push(r.id);
+          }
+        } catch {}
+        // And ALL active carts tied to this user (if provided)
+        try {
+          if (body.user_id) {
+            const { data: byUser } = await supabaseSrv
+              .from('carts')
+              .select('id')
+              .eq('status', 'active')
+              .eq('user_id', body.user_id);
+            for (const r of byUser || []) {
+              if (r?.id && !cartIds.includes(r.id)) cartIds.push(r.id);
+            }
+          }
+        } catch {}
+
+        if (cartIds.length) {
           await supabaseSrv
             .from('cart_products')
             .delete()
-            .eq('cart_id', cartData.id);
+            .in('cart_id', cartIds as any);
+          // Best-effort: clear any applied voucher reference
+          try {
+            await supabaseSrv
+              .from('carts')
+              .update({ voucher_id: null })
+              .in('id', cartIds as any);
+          } catch {}
         }
-        
+
         const output = "Cart cleared.";
         await logEvent(supabaseSrv, sessionId, body.user_id, 'user', message || 'clear cart');
         await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', output);
-        
+
         return new Response(
-          JSON.stringify({ 
-            output, 
+          JSON.stringify({
+            output,
             cart: { items: [], subtotal_cents: 0, discount_cents: 0, total_cents: 0, voucher_code: null },
             returnCart: true
           }),
@@ -727,7 +844,7 @@ serve(async (req) => {
       } catch (error) {
         console.error('delete_cart error:', error);
       }
-      
+
       return new Response(
         JSON.stringify({ output: "Cart cleared.", cart: { items: [], subtotal_cents: 0, discount_cents: 0, total_cents: 0, voucher_code: null } }),
         { headers }
@@ -940,7 +1057,7 @@ serve(async (req) => {
         let bundles: any[] = [];
         try { upsell = await computeUpsellForCart(updatedCart, cartId); upsell = applyUpsellDiscount(upsell, 10); } catch {}
         try { bundles = await computeBundleUpsell(updatedCart, cartId); } catch {}
-
+        
         return new Response(
           JSON.stringify({ output, cart: updatedCart, returnCart: true, upsell, bundles }),
           { headers }
@@ -1084,10 +1201,10 @@ serve(async (req) => {
       const history = await loadHistory(sessionId);
       let draft = "How can I help you with skincare products today?";
       try { draft = await (async () => {
-        if (!VITE_OPENAI_API_KEY) return draft;
-        const system = { role: 'system', content: 'You are a helpful skincare shopping assistant. Keep replies concise (1-2 sentences).' } as any;
+        if (!OPENAI_API_KEY) return draft;
+        const system = { role: 'system', content: 'You are a helpful skincare shopping assistant. Keep replies concise (1-2 sentences). Never mention external brand or product names; keep advice generic (e.g., "lightweight oil-free moisturizer"). If the user seems to want products, keep the text minimal because the UI will show a product list.' } as any;
         const bodyLLM: any = { model: CHAT_MODEL, messages: [system, ...history.slice(-10), { role: 'user', content: message }], temperature: 0.7, max_tokens: 180 };
-        const res = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Authorization': `Bearer ${VITE_OPENAI_API_KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify(bodyLLM) });
+        const res = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify(bodyLLM) });
         if (!res.ok) return draft;
         const j = await res.json();
         return j.choices?.[0]?.message?.content || draft;
@@ -1096,12 +1213,62 @@ serve(async (req) => {
       // Product recommendation clarifier: try to produce structured recommendations
       const productKeyword = /\b(recommend|suggest|show|need|want|looking for|moistur|serum|cleanser|sunscreen|toner|skincare|make\s?up|makeup|product|acne|oily|dry|sensitive|brighten|brightening|hyperpig|wrinkle|aging|anti-?aging|dark\s?spots?|blemish|pores?|blackheads?|whiteheads?|oil\s?control)\b/i;
       const looksLikeProductQuery = productKeyword.test(message);
-      const askedClarifierRecently = [...history]
+      const askedClarifierRecentlyLocal = [...history]
         .reverse()
         .slice(0, 6)
         .some((m: any) => m.role === 'assistant' && /((product|skincare)\s*type|skin\s*type|skin\s*concerns?|price\s*range|help\s*me\s*recommend|recommend\s+the\s+best)/i.test(String(m.content || '')));
       const priorUserProductSignal = [...history].reverse().slice(1,6).some((m: any) => m.role === 'user' && productKeyword.test(String(m.content || '')));
-      if (looksLikeProductQuery || askedClarifierRecently || priorUserProductSignal) {
+      if (looksLikeProductQuery || askedClarifierRecentlyLocal || priorUserProductSignal) {
+        // LLM-based specificity check using full chat history
+        let shouldAskClarifier = false;
+        try {
+          const duplicateClarifier = await clarifierAskedRecently(sessionId, 5000);
+          const judge = duplicateClarifier ? null : await judgeSpecificityLLM(history, message);
+          if (judge && judge.specific === false) {
+            shouldAskClarifier = true;
+            const wantType = judge?.missing?.product_type;
+            const wantConcerns = judge?.missing?.concerns;
+            const wantBudget = judge?.missing?.budget;
+            const bits: string[] = [];
+            if (wantType) bits.push('product type (e.g., serum, moisturizer, cleanser, sunscreen, toner)');
+            if (wantConcerns) bits.push('your skin concerns (e.g., oily, acne, brightening, anti-aging)');
+            if (wantBudget) bits.push('a budget range');
+            const ask = bits.length
+              ? `To recommend the best fit, could you share ${bits.join(', ')}?`
+              : 'To recommend the best fit, could you share the product type, your skin concerns, and your budget?';
+            await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', ask);
+            return new Response(JSON.stringify({ output: ask, debug: { backend: 'supabase', stage: 'clarifier_llm' } }), { headers });
+          }
+          // If the judge is unavailable (no key/timeout) fall back to a simple guard, unless we just asked
+          if (!judge && !duplicateClarifier) {
+            const lower = (message || '').toLowerCase();
+            const typeOnly = /(\bserum\b|moisturizer|moisturiser|cleanser|face\s*wash|sunscreen|\bspf\b|toner|mask|make\s?up|makeup)\b/i.test(lower);
+            const hasConcern = /(acne|oily|dry|sensitive|brighten|dark\s*spots?|aging|wrinkle|pore|blackheads?|whiteheads?|hydrating|soothing|calming|barrier|redness)/i.test(lower);
+            const hasBudget = /(under|below|budget|idr|rp|usd|price|affordable|expensive|\$\s?\d+|\d+\s?(k|rb|ribu))/i.test(lower);
+            if (typeOnly && (!hasConcern || !hasBudget)) {
+              const ask = 'To recommend the best fit, could you share your skin concerns (e.g., oily, acne, brightening, anti-aging) and your budget range?';
+              await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', ask);
+              return new Response(JSON.stringify({ output: ask, debug: { backend: 'supabase', stage: 'clarifier_fallback' } }), { headers });
+            }
+          }
+        } catch {}
+
+        // Hard requirement: if there is no concern mentioned anywhere in the last few user turns
+        // and the current message has only a product type, force a one-time clarifier.
+        try {
+          const duplicateClarifier2 = await clarifierAskedRecently(sessionId, 5000);
+          if (!duplicateClarifier2 && !userProvidedAnySpecifics(message)) {
+          const recentUserText = [...history].reverse().filter((m:any)=>m.role==='user').slice(0,6).map((m:any)=>String(m.content||'')).join(' \n ');
+          const hasAnyConcernInHistory = hasConcern(recentUserText);
+          const currentHasType = hasProductTypeText(message);
+          const currentHasConcern = hasConcern(message);
+          if (currentHasType && !currentHasConcern && !hasAnyConcernInHistory) {
+            const ask = 'Could you share your skin concerns (e.g., oily, acne, brightening, anti-aging) and your budget range?';
+            await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', ask);
+            return new Response(JSON.stringify({ output: ask, debug: { backend: 'supabase', stage: 'clarifier_hard' } }), { headers });
+          }
+          }
+        } catch {}
         const needs = await extractNeeds(message, history);
         // Fill product_type from prior user messages if missing
         if (!needs?.product_type) {
@@ -1124,11 +1291,11 @@ serve(async (req) => {
             let closest = await vectorSearchProducts(enrichedQuery, 6, 0.05);
             if (!closest.length) closest = await keywordSearchProducts(enrichedQuery, 6);
             if (closest.length) {
-              const msg = "I couldn’t find an exact match for your needs. Here are the closest items we have:";
+              const msg = "I couldn't find an exact match for your needs. Here are the closest items we have:";
               await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', msg);
-              return new Response(JSON.stringify({ output: msg, products: closest }), { headers });
+              return new Response(JSON.stringify({ output: msg, products: closest, debug: { backend: 'supabase', stage: 'closest_matches' } }), { headers });
             }
-            const msg2 = "I couldn’t find a match based on that. Could you rephrase or provide more details?";
+            const msg2 = "I couldn't find a match based on that. Could you rephrase or provide more details?";
             await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', msg2);
             await persistHistoryStructured(sessionId, { role: 'assistant', content: msg2, kind: 'text', clarifier: { needs } });
             return new Response(JSON.stringify({ output: msg2 }), { headers });
@@ -1145,10 +1312,12 @@ serve(async (req) => {
             const topTags = Array.from(freq.entries()).sort((a,b)=>b[1]-a[1]).slice(0, 5).map(([t])=>t);
             if (topTags.length) tagHint = ` For example: ${topTags.slice(0,3).join(', ')}.`;
           } catch {}
-          const ask = `To recommend the best fit, could you share the product type (moisturizer, serum, cleanser, sunscreen, toner), your skin concerns (e.g., oily, acne, brightening), and a price range?${tagHint}`;
-          await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', ask);
-          await persistHistoryStructured(sessionId, { role: 'assistant', content: ask, kind: 'text', clarifier: { needs } });
-          return new Response(JSON.stringify({ output: ask }), { headers });
+          const duplicateClarifier3 = await clarifierAskedRecently(sessionId, 5000);
+          if (!duplicateClarifier3 && !userProvidedAnySpecifics(message)) {
+            const ask = `To recommend the best fit, could you share the product type (moisturizer, serum, cleanser, sunscreen, toner), your skin concerns (e.g., oily, acne, brightening), and a price range?${tagHint}`;
+            await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', ask);
+            return new Response(JSON.stringify({ output: ask, debug: { backend: 'supabase', stage: 'clarifier_first' } }), { headers });
+          }
         }
 
         // Weak matches: if top score is likely low (heuristic) → ask 1 follow-up instead
@@ -1159,24 +1328,39 @@ serve(async (req) => {
         const reply = draft || 'Here are some recommendations based on your needs:';
         await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', reply);
         // Note: Frontend persists structured products; avoid duplicate DB insert here
-        return new Response(JSON.stringify({ output: reply, products }), { headers });
+        return new Response(JSON.stringify({ output: reply, products, debug: { backend: 'supabase', stage: 'products' } }), { headers });
       }
       // Escalate based on the LLM draft only (no keywords)
       try {
-        if (VITE_OPENAI_API_KEY) {
-          const sys = "Return JSON {\\"escalate\\": boolean}. Set escalate=true if the assistant draft does not fully answer/resolve the user's last message OR if the user explicitly requests a ticket, a human agent, or customer support contact. Otherwise escalate=false.";
-          const res = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${VITE_OPENAI_API_KEY}` }, body: JSON.stringify({ model: CHAT_MODEL, messages: [{ role: 'system', content: sys }, { role: 'user', content: `User: ${message}\nAssistantDraft: ${draft}` }], temperature: 0, response_format: { type: 'json_object' } }) });
+        if (OPENAI_API_KEY) {
+          const sys = 'Return JSON {"escalate": boolean}. Set escalate=true if the assistant draft does not fully answer/resolve the user\'s last message OR if the user explicitly requests a ticket, a human agent, or customer support contact. Otherwise escalate=false.';
+          const res = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_API_KEY}` }, body: JSON.stringify({ model: CHAT_MODEL, messages: [{ role: 'system', content: sys }, { role: 'user', content: `User: ${message}\nAssistantDraft: ${draft}` }], temperature: 0, response_format: { type: 'json_object' } }) });
           const data = await res.json().catch(() => ({}));
           const parsed = JSON.parse(data?.choices?.[0]?.message?.content || '{}');
           if (parsed?.escalate === true) {
             const payload = [{ user_email: body.user_email || 'anonymous@example.com', message, category: 'general', session_id: sessionId, user_Id: body.user_id || 'anonymous', subject: (message || 'Customer support request').slice(0, 80) }];
             try { const r = await fetch(Deno.env.get('TICKET_WEBHOOK_URL') || 'https://primary-production-b68a.up.railway.app/webhook/ticket_create', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }); if (!r.ok) { try { console.error('Ticket webhook failed', r.status, await r.text()); } catch {} } } catch (e) { console.error('Ticket webhook error', e); }
-            const reply = `I’ve created a support ticket so a human can assist you shortly. Subject: ${(message || 'Customer support request').slice(0, 80)}.`;
+            const reply = `I've created a support ticket so a human can assist you shortly. Subject: ${(message || 'Customer support request').slice(0, 80)}.`;
             await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', reply);
             return new Response(JSON.stringify({ output: reply, ticket_created: true }), { headers });
           }
         }
       } catch {}
+
+      // Do NOT auto-show products for greetings or very short messages
+      try {
+        const trimmed = String(message || '').trim();
+        const looksLikeGreeting = /^(hi|hello|hey|halo|hai|yo|hiya|sup)\b/i.test(trimmed);
+        if (!looksLikeGreeting && trimmed.length >= 6) {
+          const fallbackProducts = await searchProductsSmart(message, 6);
+          if (fallbackProducts && fallbackProducts.length) {
+            const reply = 'Here are the recommended products below.';
+            await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', reply);
+            return new Response(JSON.stringify({ output: reply, products: fallbackProducts }), { headers });
+          }
+        }
+      } catch {}
+
       await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', draft);
       return new Response(JSON.stringify({ output: draft }), { headers });
     }
@@ -1185,10 +1369,10 @@ serve(async (req) => {
       const webhookUrl = Deno.env.get('TICKET_WEBHOOK_URL') || 'https://primary-production-b68a.up.railway.app/webhook/ticket_create';
       let subject = 'Customer support request';
       let category = 'general';
-      if (VITE_OPENAI_API_KEY) {
+      if (OPENAI_API_KEY) {
         try {
           const sys = `Extract concise subject and category for a customer support ticket from the user's last message. Return JSON {subject:string, category:string}. Categories: product_info, order, payment, shipping, return_refund, account, other.`;
-          const res = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${VITE_OPENAI_API_KEY}` }, body: JSON.stringify({ model: CHAT_MODEL, messages: [{ role: 'system', content: sys }, { role: 'user', content: message }], temperature: 0, response_format: { type: 'json_object' } }) });
+          const res = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_API_KEY}` }, body: JSON.stringify({ model: CHAT_MODEL, messages: [{ role: 'system', content: sys }, { role: 'user', content: message }], temperature: 0, response_format: { type: 'json_object' } }) });
           const data = await res.json();
           const parsed = JSON.parse(data?.choices?.[0]?.message?.content || '{}');
           subject = typeof parsed.subject === 'string' && parsed.subject.trim() ? parsed.subject.trim() : subject;
@@ -1207,7 +1391,7 @@ serve(async (req) => {
         const r = await fetch(webhookUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }); 
         if (!r.ok) { console.error('Ticket webhook failed', r.status, await r.text().catch(()=>'')); }
       } catch (e) { console.error('Ticket webhook error', e); }
-      const output = `I’ve created a support ticket so a human can assist you shortly. Subject: ${subject}.`;
+      const output = `I've created a support ticket so a human can assist you shortly. Subject: ${subject}.`;
       await logEvent(supabaseSrv, sessionId, body.user_id, 'user', message);
       await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', output);
       return new Response(JSON.stringify({ output, ticket_created: true }), { headers });
@@ -1216,26 +1400,26 @@ serve(async (req) => {
     // Fallback with LLM-based draft and escalation
     let fallbackDraft = "How can I help you with skincare products today?";
     try {
-      if (VITE_OPENAI_API_KEY) {
+      if (OPENAI_API_KEY) {
         const history = await (async () => {
           try {
-            const { data } = await (createClient(Deno.env.get('VITE_SUPABASE_URL')!, Deno.env.get('VITE_SUPABASE_SERVICE_ROLE_KEY')!))
+            const { data } = await (createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!))
               .from('events').select('payload').eq('session_id', sessionId).eq('type', 'message').order('created_at', { ascending: false }).limit(16);
             return (data || []).map((r: any) => ({ role: r.payload?.role || 'user', content: r.payload?.content || '' })).reverse();
           } catch { return []; }
         })();
         const system = { role: 'system', content: 'You are a helpful skincare shopping assistant. Keep replies concise (1-2 sentences).' } as any;
         const bodyLLM: any = { model: CHAT_MODEL, messages: [system, ...history.slice(-10), { role: 'user', content: message }], temperature: 0.7, max_tokens: 180 };
-        const res = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Authorization': `Bearer ${VITE_OPENAI_API_KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify(bodyLLM) });
+        const res = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify(bodyLLM) });
         if (res.ok) { const j = await res.json(); fallbackDraft = j.choices?.[0]?.message?.content || fallbackDraft; }
-        const sys = "Return JSON {\\"escalate\\": boolean}. Set escalate=true if the assistant draft does not fully answer/resolve the user's last message OR if the user explicitly requests a ticket, a human agent, or customer support contact. Otherwise escalate=false.";
-        const res2 = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${VITE_OPENAI_API_KEY}` }, body: JSON.stringify({ model: CHAT_MODEL, messages: [{ role: 'system', content: sys }, { role: 'user', content: `User: ${message}\nAssistantDraft: ${fallbackDraft}` }], temperature: 0, response_format: { type: 'json_object' } }) });
+        const sys = 'Return JSON {"escalate": boolean}. Set escalate=true if the assistant draft does not fully answer/resolve the user\'s last message OR if the user explicitly requests a ticket, a human agent, or customer support contact. Otherwise escalate=false.';
+        const res2 = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_API_KEY}` }, body: JSON.stringify({ model: CHAT_MODEL, messages: [{ role: 'system', content: sys }, { role: 'user', content: `User: ${message}\nAssistantDraft: ${fallbackDraft}` }], temperature: 0, response_format: { type: 'json_object' } }) });
         const data2 = await res2.json().catch(() => ({}));
         const parsed2 = JSON.parse(data2?.choices?.[0]?.message?.content || '{}');
         if (parsed2?.escalate === true) {
           const payload = [{ user_email: body.user_email || 'anonymous@example.com', message, category: 'general', session_id: sessionId, user_Id: body.user_id || 'anonymous', subject: (message || 'Customer support request').slice(0, 80) }];
           try { const r = await fetch(Deno.env.get('TICKET_WEBHOOK_URL') || 'https://primary-production-b68a.up.railway.app/webhook/ticket_create', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }); if (!r.ok) { try { console.error('Ticket webhook failed', r.status, await r.text()); } catch {} } } catch (e) { console.error('Ticket webhook error', e); }
-          const reply = `I’ve created a support ticket so a human can assist you shortly. Subject: ${(message || 'Customer support request').slice(0, 80)}.`;
+          const reply = `I've created a support ticket so a human can assist you shortly. Subject: ${(message || 'Customer support request').slice(0, 80)}.`;
           await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', reply);
           return new Response(JSON.stringify({ output: reply, ticket_created: true }), { headers });
         }
