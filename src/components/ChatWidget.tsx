@@ -104,28 +104,46 @@ const ChatWidget = () => {
   const audioCtxRef = useRef<any>(null);
   // Prevent AI text animation from re-triggering on tab switch/re-render
   const animatedTextStartedRef = useRef<Set<any>>(new Set());
+  // Typewriter counts for assistant text
+  const aiCountsRef = useRef<Record<any, number>>({});
+  const TYPE_INTERVAL_MS = 18;
+
+  // Start typewriter for the newest assistant text message
+  useEffect(() => {
+    const lastAssistant = [...messages].reverse().find((m) => !m.isUser && (!m.kind || m.kind === 'text')) as any;
+    if (!lastAssistant || !lastAssistant.text) return;
+    const id = lastAssistant.id;
+    if ((aiCountsRef.current[id] || 0) >= String(lastAssistant.text).length) return;
+    let i = aiCountsRef.current[id] || 0;
+    const limit = String(lastAssistant.text).length;
+    const timer = window.setInterval(() => {
+      i = Math.min(i + 1, limit);
+      aiCountsRef.current[id] = i;
+      // force rerender
+      try { (setMessages as any)((prev: any) => [...prev]); } catch {}
+      if (i >= limit) window.clearInterval(timer);
+    }, TYPE_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [messages]);
 
   const renderAnimatedText = (id: any, text: string) => {
-    const already = animatedTextStartedRef.current.has(id);
-    if (!already) animatedTextStartedRef.current.add(id);
-    const lines = String(text || '').split('\n');
-    let idx = 0;
+    const total = String(text || '').length;
+    const count = Math.max(0, Math.min(aiCountsRef.current[id] ?? total, total));
+    const visible = String(text || '').slice(0, count);
+    const rest = String(text || '').slice(count);
+    const parts = visible.split('\n');
     return (
       <span>
-        {lines.map((line, li) => (
+        {parts.map((line, li) => (
           <span key={`line-${li}`}>
             {line.split('').map((ch, i) => (
-              <span
-                key={`ch-${li}-${i}`}
-                className={already ? undefined : 'ai-fade-char'}
-                style={already ? undefined : { animationDelay: `${(idx++ * 0.015).toFixed(3)}s` }}
-              >
-                {ch}
-              </span>
+              <span key={`ch-${li}-${i}`} className="ai-fade-char">{ch}</span>
             ))}
-            {li < lines.length - 1 ? <br /> : null}
+            {li < parts.length - 1 ? <br /> : null}
           </span>
         ))}
+        {/* keep layout stable while typing */}
+        {rest ? <span style={{ opacity: 0 }}>{rest}</span> : null}
       </span>
     );
   };
