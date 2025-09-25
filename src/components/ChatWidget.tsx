@@ -100,6 +100,113 @@ const ChatWidget = () => {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const productScrollRefs = useRef<Record<number, HTMLDivElement | null>>({});
+  // Simple notification sound using Web Audio
+  const audioCtxRef = useRef<any>(null);
+  // Prevent AI text animation from re-triggering on tab switch/re-render
+  const animatedTextStartedRef = useRef<Set<any>>(new Set());
+
+  const renderAnimatedText = (id: any, text: string) => {
+    const already = animatedTextStartedRef.current.has(id);
+    if (!already) animatedTextStartedRef.current.add(id);
+    const lines = String(text || '').split('\n');
+    let idx = 0;
+    return (
+      <span>
+        {lines.map((line, li) => (
+          <span key={`line-${li}`}>
+            {line.split('').map((ch, i) => (
+              <span
+                key={`ch-${li}-${i}`}
+                className={already ? undefined : 'ai-fade-char'}
+                style={already ? undefined : { animationDelay: `${(idx++ * 0.015).toFixed(3)}s` }}
+              >
+                {ch}
+              </span>
+            ))}
+            {li < lines.length - 1 ? <br /> : null}
+          </span>
+        ))}
+      </span>
+    );
+  };
+
+  // Mark latest assistant text as animated after a duration so it won't restart on tab switches
+  useEffect(() => {
+    const lastAssistant = [...messages].reverse().find((m) => !m.isUser && (!m.kind || m.kind === 'text')) as any;
+    if (!lastAssistant) return;
+    if (animatedTextStartedRef.current.has(lastAssistant.id)) return;
+    const len = String(lastAssistant.text || '').length;
+    const total = Math.min(6000, Math.max(800, len * 18));
+    const t = window.setTimeout(() => {
+      animatedTextStartedRef.current.add(lastAssistant.id);
+    }, total + 50);
+    return () => window.clearTimeout(t);
+  }, [messages]);
+  const playNotify = () => {
+    try {
+      const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
+      if (!AudioCtx) return;
+      let ctx = audioCtxRef.current as AudioContext | null;
+      if (!ctx) {
+        ctx = new AudioCtx();
+        audioCtxRef.current = ctx;
+      }
+      if (ctx.state === 'suspended') ctx.resume();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      // Two quick tones for a clearer, louder ping
+      osc.frequency.setValueAtTime(880, ctx.currentTime);
+      gain.gain.setValueAtTime(0.0001, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.18, ctx.currentTime + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.14);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start();
+      // brief second chirp
+      const osc2 = ctx.createOscillator();
+      const gain2 = ctx.createGain();
+      osc2.type = 'sine';
+      osc2.frequency.setValueAtTime(1320, ctx.currentTime + 0.15);
+      gain2.gain.setValueAtTime(0.0001, ctx.currentTime + 0.15);
+      gain2.gain.exponentialRampToValueAtTime(0.14, ctx.currentTime + 0.17);
+      gain2.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.28);
+      osc2.connect(gain2).connect(ctx.destination);
+      osc2.start(ctx.currentTime + 0.15);
+      osc.stop(ctx.currentTime + 0.3);
+      osc2.stop(ctx.currentTime + 0.32);
+    } catch {}
+  };
+
+  // Unlock Web Audio after first user interaction so the beep can play
+  useEffect(() => {
+    const unlock = () => {
+      try {
+        const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
+        if (!AudioCtx) return;
+        let ctx = audioCtxRef.current as AudioContext | null;
+        if (!ctx) {
+          ctx = new AudioCtx();
+          audioCtxRef.current = ctx;
+        }
+        if (ctx.state === 'suspended') ctx.resume();
+        // create an inaudible short sound to fully unlock on iOS
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        gain.gain.value = 0.0001;
+        osc.connect(gain).connect(ctx.destination);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.01);
+      } catch {}
+      window.removeEventListener('pointerdown', unlock);
+      window.removeEventListener('keydown', unlock);
+    };
+    window.addEventListener('pointerdown', unlock);
+    window.addEventListener('keydown', unlock);
+    return () => {
+      window.removeEventListener('pointerdown', unlock);
+      window.removeEventListener('keydown', unlock);
+    };
+  }, []);
   const [vouchersShown, setVouchersShown] = useState<boolean>(() => {
     try {
       const sid = localStorage.getItem('chat_session_id');
@@ -120,6 +227,12 @@ const ChatWidget = () => {
   const [bundleOffers, setBundleOffers] = useState<any[]>([]);
   const [bundleLoading, setBundleLoading] = useState(false);
   const [bundleAdding, setBundleAdding] = useState(false);
+	const [bundleMounted, setBundleMounted] = useState(false);
+	const [bundleAnim, setBundleAnim] = useState<AnimPhase>(null);
+  // Image preview modal state
+  const [imgPreview, setImgPreview] = useState<string | null>(null);
+  const [imgPreviewMounted, setImgPreviewMounted] = useState(false);
+  const [imgAnim, setImgAnim] = useState<AnimPhase>(null);
   const lastCartHashRef = useRef<string | null>(null);
 
   const calcCartHash = (cart: any): string => {
@@ -230,13 +343,48 @@ const ChatWidget = () => {
           }
         } catch {}
       }
-      setBundleOffers(bundles || []);
-      setShowBundleModal(true);
+		setBundleOffers(bundles || []);
+		setShowBundleModal(true);
     } catch {
-      setBundleOffers([]);
-      setShowBundleModal(true);
+		setBundleOffers([]);
+		setShowBundleModal(true);
     } finally { setBundleLoading(false); }
   };
+
+	// Bundle modal animation mount/unmount
+	useEffect(() => {
+		if (showBundleModal) {
+			setBundleMounted(true);
+			requestAnimationFrame(() => setBundleAnim("in"));
+		} else if (bundleMounted) {
+			setBundleAnim("out");
+			const t = setTimeout(() => { setBundleMounted(false); setBundleAnim(null); }, 300);
+			return () => clearTimeout(t);
+		}
+	}, [showBundleModal, bundleMounted]);
+
+	const closeBundleModal = () => {
+		if (bundleAdding) return; // prevent closing while adding
+		setShowBundleModal(false);
+	};
+
+// Image preview mount/unmount and ESC close
+useEffect(() => {
+  if (imgPreview) {
+    setImgPreviewMounted(true);
+    requestAnimationFrame(() => setImgAnim("in"));
+  } else if (imgPreviewMounted) {
+    setImgAnim("out");
+    const t = setTimeout(() => { setImgPreviewMounted(false); setImgAnim(null); }, 200);
+    return () => clearTimeout(t);
+  }
+}, [imgPreview, imgPreviewMounted]);
+
+useEffect(() => {
+  const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setImgPreview(null); };
+  if (imgPreviewMounted) window.addEventListener('keydown', onKey as any);
+  return () => window.removeEventListener('keydown', onKey as any);
+}, [imgPreviewMounted]);
 
   const addBundleToCart = async (bundle: any) => {
     try {
@@ -357,15 +505,15 @@ const ChatWidget = () => {
     }
   };
 
-  const renderBundlePortal = () =>
+	const renderBundlePortal = () =>
     createPortal(
-      <div className="fixed inset-0 z-[100000]">
-        <div className="absolute inset-0 bg-black/40" onClick={() => setShowBundleModal(false)} />
-        <div className="absolute inset-0 p-4 md:p-8 overflow-auto flex items-center justify-center">
-          <div className="w-full max-w-3xl md:max-w-4xl bg-white rounded-2xl shadow-2xl border border-black/10 min-sh-[510px] flex flex-col">
+			<div className="fixed inset-0 z-[100000]">
+				<div className={`absolute inset-0 bg-black/40 transition-opacity duration-300 ${bundleAnim === 'in' ? 'opacity-100' : 'opacity-0'}`} onClick={closeBundleModal} />
+				<div className="absolute inset-0 p-4 md:p-8 overflow-auto flex items-center justify-center">
+					<div className={`w-full max-w-3xl md:max-w-4xl bg-white rounded-2xl shadow-2xl border border-black/10 min-sh-[510px] flex flex-col transform transition-all duration-300 ${bundleAnim === 'in' ? 'opacity-100 translate-y-0 scale-100' : 'opacity-0 translate-y-2 scale-95'}`}>
             <div className="flex items-center justify-between px-5 py-4 rounded-t-2xl bg-gradient-to-r from-black to-gray-800 text-white">
               <div className="text-lg font-semibold">Bundle and save 10%</div>
-              <Button variant="ghost" size="sm" className="text-white hover:bg-white/10" onClick={() => setShowBundleModal(false)}>Close</Button>
+							<Button variant="ghost" size="sm" className="text-white hover:bg-white/10" onClick={closeBundleModal}>Close</Button>
             </div>
             <div className="p-5 flex-1 overflow-auto">
             {bundleLoading ? (
@@ -378,20 +526,28 @@ const ChatWidget = () => {
                   <div key={idx} className="border rounded-xl p-4 bg-white">
                     <div className="text-lg font-semibold">{b.title}</div>
                     <div className="text-sm text-gray-600 mt-1">{b.description || 'Special pricing when purchased together.'}</div>
-                    <div className="mt-3 grid grid-cols-3 gap-4">
-                      {(b.items||[]).slice(0,3).map((p: any, i:number)=> (
-                        <div key={i} className="text-xs">
-                          {p.image_url && (<img src={p.image_url} alt={p.name} className="w-full h-52 object-cover rounded-md border" />)}
-                          <div className="truncate mt-1 font-medium" title={p.name}>{p.name}</div>
-                          <div className="text-[12px] text-gray-700">${((p.price_cents||0)/100).toFixed(2)}</div>
-                        </div>
-                      ))}
-                    </div>
+										<div className="mt-3 grid grid-cols-3 gap-4">
+											{(b.items||[]).slice(0,3).map((p: any, i:number)=> (
+												<div key={i} className="text-xs group rounded-md border bg-white/60 hover:shadow-lg transition-shadow overflow-hidden">
+													{p.image_url && (
+														<div className="relative rounded-md overflow-hidden">
+															<img
+																src={p.image_url}
+																alt={p.name}
+																className="w-full h-52 object-cover transition-transform duration-300 ease-out group-hover:scale-105"
+															/>
+														</div>
+													)}
+													<div className="truncate mt-1 font-medium px-2" title={p.name}>{p.name}</div>
+													<div className="text-[12px] text-gray-700 px-2 pb-2">${((p.price_cents||0)/100).toFixed(2)}</div>
+												</div>
+											))}
+										</div>
                     <div className="mt-4 flex items-center justify-between">
-                      <div className="text-sm">Bundle price: <span className="font-semibold text-lg">${((b.price_cents||0)/100).toFixed(2)}</span> <span className="ml-2 line-through text-gray-500">${((b.original_price_cents||0)/100).toFixed(2)}</span> <span className="ml-2 text-green-700 font-medium">{b.discount_percent || 10}% off</span></div>
-                      <div className="flex gap-3">
-                        <Link to={CART_URL} className="inline-flex items-center justify-center rounded-md border border-gray-300 bg-white text-black text-sm px-4 py-2">Go to cart</Link>
-                        <Button className="px-4 disabled:opacity-60 disabled:cursor-not-allowed" onClick={() => addBundleToCart(b)} disabled={bundleAdding}>
+											<div className="text-sm">Bundle price: <span className="font-semibold text-lg">${((b.price_cents||0)/100).toFixed(2)}</span> <span className="ml-2 line-through text-gray-500">${((b.original_price_cents||0)/100).toFixed(2)}</span> <span className="ml-2 text-green-700 font-medium">{b.discount_percent || 10}% off</span></div>
+											<div className="flex gap-3">
+												<Link to={CART_URL} className="inline-flex items-center justify-center rounded-md border border-gray-300 bg-white text-black text-sm px-4 py-2 transition-all duration-200 hover:-translate-y-0.5 hover:shadow-md">Go to cart</Link>
+												<Button className="px-4 disabled:opacity-60 disabled:cursor-not-allowed transition-all duration-200 hover:-translate-y-0.5 hover:shadow-md" onClick={() => addBundleToCart(b)} disabled={bundleAdding}>
                           {bundleAdding ? (
                             <span className="inline-flex items-center gap-2"><Loader2 className="h-4 w-4 animate-spin" /> Adding…</span>
                           ) : (
@@ -708,7 +864,9 @@ const ChatWidget = () => {
         if (botResponse.kind === 'text' && /recommended products/i.test(botResponse.text || '') && last && last.kind === 'text' && /recommended products/i.test(last.text || '')) {
           return prev;
         }
-        return [...prev, botResponse];
+        const next = [...prev, botResponse];
+        playNotify();
+        return next;
       });
       // Persist assistant message with structured payload so carousels restore after refresh
       try {
@@ -755,7 +913,7 @@ const ChatWidget = () => {
               kind: 'products',
               products,
             } as any;
-            setMessages((prev) => [...prev, fallback]);
+            setMessages((prev) => { const next = [...prev, fallback]; playNotify(); return next; });
             return;
           }
         }
@@ -1076,7 +1234,7 @@ const ChatWidget = () => {
           timestamp: new Date(),
           kind: "text",
         };
-        setMessages((prev) => [...prev, botResponse]);
+        setMessages((prev) => { const next = [...prev, botResponse]; playNotify(); return next; });
         try { if (supabase) { await (supabase as any).from('n8n_chat_histories').insert({ session_id: currentSessionId, message: { role: 'assistant', content: botResponse.text } }); } } catch {}
       }
     } catch (error) {
@@ -1123,7 +1281,7 @@ const ChatWidget = () => {
           timestamp: new Date(),
           kind: "text",
         };
-        setMessages((prev) => [...prev, botResponse]);
+        setMessages((prev) => { const next = [...prev, botResponse]; playNotify(); return next; });
         markCartUpdated();
       }
     } catch (error) {
@@ -1171,7 +1329,7 @@ const ChatWidget = () => {
           timestamp: new Date(),
           kind: "text",
         };
-        setMessages((prev) => [...prev, botResponse]);
+        setMessages((prev) => { const next = [...prev, botResponse]; playNotify(); return next; });
         try { if (supabase) { await (supabase as any).from('n8n_chat_histories').insert({ session_id: currentSessionId, message: { role: 'assistant', content: botResponse.text } }); } } catch {}
       }
     } catch (e) {
@@ -1235,7 +1393,7 @@ const ChatWidget = () => {
           timestamp: new Date(),
           kind: "text",
         };
-        setMessages((prev) => [...prev, botResponse]);
+        setMessages((prev) => { const next = [...prev, botResponse]; playNotify(); return next; });
         try { if (supabase) { await (supabase as any).from('n8n_chat_histories').insert({ session_id: currentSessionId, role: 'assistant', content: botResponse.text }); } } catch {}
         markCartUpdated();
       }
@@ -1366,8 +1524,28 @@ const ChatWidget = () => {
 
             {!isMinimized && (
               <CardContent className="flex flex-col h-[calc(100%-60px)] p-0">
-                {/* Modal for Bundles */}
-                {showBundleModal && renderBundlePortal()}
+				{/* Modal for Bundles with transitions */}
+				{bundleMounted && renderBundlePortal()}
+                {/* Image preview modal */}
+                {imgPreviewMounted && createPortal(
+                  <div className="fixed inset-0 z-[100001]">
+                    <div className={`absolute inset-0 bg-black/60 transition-opacity duration-200 ${imgAnim === 'in' ? 'opacity-100' : 'opacity-0'}`} />
+                    <div className="absolute inset-0 p-4 md:p-10 flex items-center justify-center" onClick={() => setImgPreview(null)}>
+                      <img
+                        src={imgPreview || ''}
+                        alt="preview"
+                        className={`max-h-[90vh] max-w-[90vw] rounded-xl shadow-2xl transform transition-all duration-200 cursor-zoom-out ${imgAnim === 'in' ? 'opacity-100 scale-100' : 'opacity-0 scale-95'}`}
+                        onClick={(e) => e.stopPropagation()}
+                      />
+                      <button
+                        className={`absolute top-4 right-4 h-8 w-8 rounded-full bg-white/90 text-black shadow transition-opacity duration-200 hover:bg-white ${imgAnim === 'in' ? 'opacity-100' : 'opacity-0'}`}
+                        onClick={() => setImgPreview(null)}
+                        aria-label="Close preview"
+                      >
+                        <X className="h-5 w-5 m-auto" />
+                      </button>
+                    </div>
+                  </div>, document.body)}
                 {/* Messages */}
                 <div className="flex-1 overflow-y-auto p-4 space-y-4">
                   {messages.map((message) => (
@@ -1376,57 +1554,26 @@ const ChatWidget = () => {
                       className={`flex ${message.isUser ? "justify-end" : "justify-start"}`}
                     >
                       <div
-                        className={`max-w-[80%] rounded-lg px-3 py-2 text-sm ${
+                        className={`max-w-[80%] rounded-lg px-3 py-2 text-sm msg-pop-in ${
                           message.isUser
                             ? "bg-black text-white"
                             : "bg-white text-black border border-black/10"
                         }`}
                       >
                         {message.isUser ? (
-                          <span className="whitespace-pre-wrap">{message.text}</span>
+                          <span className="whitespace-pre-wrap">
+                            {String(message.text || "")
+                              .split("")
+                              .map((ch, i) => (
+                                <span key={i} className="ai-fade-char" style={{ animationDelay: `${i * 0.01}s` }}>{ch}</span>
+                              ))}
+                          </span>
                         ) : (
                           <>
-                            {/* Bot messages - markdown text */}
-                            <ReactMarkdown
-                              components={{
-                                p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
-                                strong: ({ children }) => <strong className="font-semibold">{children}</strong>,
-                                em: ({ children }) => <em className="italic">{children}</em>,
-                                ul: ({ children }) => <ul className="list-disc ml-4 mb-2">{children}</ul>,
-                                ol: ({ children }) => <ol className="list-decimal ml-4 mb-2">{children}</ol>,
-                                li: ({ children }) => <li className="mb-1">{children}</li>,
-                                a: ({ href, children }) => (
-                                  <a
-                                    href={href}
-                                    target="_blank"
-                                    rel="noopener noreferrer"
-                                    className="text-blue-600 hover:text-blue-800 underline"
-                                  >
-                                    {children}
-                                  </a>
-                                ),
-                                img: ({ src, alt }) => (
-                                  <img
-                                    src={src}
-                                    alt={alt}
-                                    className="max-w-full h-auto rounded-md shadow-sm my-2 cursor-pointer hover:shadow-md transition-shadow"
-                                    onClick={() => window.open(src as string, '_blank')}
-                                  />
-                                ),
-                                code: ({ children }) => (
-                                  <code className="bg-gray-200 px-1 py-0.5 rounded text-xs font-mono">
-                                    {children}
-                                  </code>
-                                ),
-                                blockquote: ({ children }) => (
-                                  <blockquote className="border-l-4 border-gray-300 pl-4 italic">
-                                    {children}
-                                  </blockquote>
-                                ),
-                              }}
-                            >
-                              {message.text}
-                            </ReactMarkdown>
+                            {/* Bot messages - animated text (letter-by-letter fade) */}
+                            <div className="whitespace-pre-wrap">
+                              {renderAnimatedText((message as any).id, message.text)}
+                            </div>
 
                             {/* Rich content renderers */}
                             {message.kind === "products" && message.products && (
@@ -1442,8 +1589,9 @@ const ChatWidget = () => {
                                           <img
                                             src={p.image_url}
                                             alt={p.name}
-                                            className="w-full h-36 rounded object-cover border"
+                                            className="w-full h-36 rounded object-cover border cursor-zoom-in transition-transform duration-200 ease-out hover:scale-105 hover:shadow"
                                             loading="lazy"
+                                            onClick={() => p.image_url ? setImgPreview(p.image_url) : null}
                                             onError={(e) => { (e.currentTarget as HTMLImageElement).src = '/placeholder.svg'; }}
                                           />
                                         )}
@@ -1475,15 +1623,16 @@ const ChatWidget = () => {
                                               key={i}
                                               src={src}
                                               alt={`${p.name}-${i}`}
-                                              className="h-14 w-14 rounded object-cover border flex-none"
+                                              className="h-14 w-14 rounded object-cover border flex-none cursor-zoom-in transition-transform duration-200 ease-out hover:scale-105 hover:shadow"
                                               loading="lazy"
+                                              onClick={() => setImgPreview(src)}
                                               onError={(e) => { (e.currentTarget as HTMLImageElement).src = '/placeholder.svg'; }}
                                             />
                                           ))}
                                         </div>
                                       )}
                                       <div className="mt-3">
-                                        <Button size="sm" className="w-full" onClick={() => addToCart(p.name, 1, p.price_cents, p.id as any, (p as any).variant_id, p.image_url)}>
+                                        <Button size="sm" className="w-full transition-all duration-200 hover:-translate-y-0.5 hover:shadow-md active:scale-95" onClick={() => addToCart(p.name, 1, p.price_cents, p.id as any, (p as any).variant_id, p.image_url)}>
                                           Add to cart
                                         </Button>
                                       </div>
@@ -1545,9 +1694,10 @@ const ChatWidget = () => {
                                         <img
                                           src={it.image_url}
                                           alt={it.product_name}
-                                          className="w-12 h-12 rounded-md object-cover border"
+                                          className="w-12 h-12 rounded-md object-cover border cursor-zoom-in transition-transform duration-200 ease-out hover:scale-105 hover:shadow"
                                           loading="lazy"
                                           onError={(e) => { (e.currentTarget as HTMLImageElement).src = '/placeholder.svg'; }}
+                                          onClick={() => it.image_url ? setImgPreview(it.image_url as string) : null}
                                         />
                                       )}
                                       <div className="flex-1 min-w-0">
@@ -1557,7 +1707,7 @@ const ChatWidget = () => {
                                             <Button
                                               variant="ghost"
                                               size="icon"
-                                              className="h-6 w-6"
+                                              className="h-6 w-6 transition-transform duration-150 hover:-translate-y-0.5 active:scale-95"
                                               aria-label="Decrease quantity"
                                               onClick={() => updateLineQty({ product_name: it.product_name, product_id: (it as any).product_id, variant_id: (it as any).variant_id, unit_price_cents: (it as any).unit_price_cents, image_url: (it as any).image_url }, Math.max(0, (it.qty || 0) - 1))}
                                             >
@@ -1567,7 +1717,7 @@ const ChatWidget = () => {
                                             <Button
                                               variant="ghost"
                                               size="icon"
-                                              className="h-6 w-6"
+                                              className="h-6 w-6 transition-transform duration-150 hover:-translate-y-0.5 active:scale-95"
                                               aria-label="Increase quantity"
                                               onClick={() => updateLineQty({ product_name: it.product_name, product_id: (it as any).product_id, variant_id: (it as any).variant_id, unit_price_cents: (it as any).unit_price_cents, image_url: (it as any).image_url }, (it.qty || 0) + 1)}
                                             >
@@ -1577,7 +1727,7 @@ const ChatWidget = () => {
                                           <Button
                                             variant="link"
                                             size="sm"
-                                            className="h-auto p-0 text-red-600"
+                                            className="h-auto p-0 text-red-600 transition-colors duration-150 hover:text-red-700 underline-offset-2 hover:underline"
                                             onClick={() => deleteLine({ product_name: it.product_name, product_id: (it as any).product_id, variant_id: (it as any).variant_id })}
                                           >
                                             Remove
@@ -1602,18 +1752,19 @@ const ChatWidget = () => {
                                     <div className="text-green-600 mt-1">Voucher applied: <strong>{message.cart.voucher_code}</strong></div>
                                   ) : null}
                                   <div className="mt-3 grid grid-cols-2 gap-2">
-                                    <Button variant="destructive" size="sm" className="w-full disabled:opacity-60 disabled:cursor-not-allowed" onClick={clearCart} disabled={isLoading || (extractCartCents(message.cart).total === 0)}>
-                                      Clear cart
+                                    <Button variant="destructive" size="sm" className="w-full disabled:opacity-60 disabled:cursor-not-allowed transition-all duration-200 hover:-translate-y-0.5 hover:shadow" onClick={clearCart} disabled={isLoading || (extractCartCents(message.cart).total === 0)}>
+                                      Clear Cart
                                     </Button>
                                     <Button
-                                      className="inline-flex items-center justify-center rounded-md bg-primary text-white text-sm py-1.5 w-full disabled:opacity-60 disabled:cursor-not-allowed"
+                                      size="sm"
+                                      className="w-full disabled:opacity-60 disabled:cursor-not-allowed transition-all duration-200 hover:-translate-y-0.5 hover:shadow"
                                       onClick={openBundleModal}
                                       disabled={bundleLoading || (extractCartCents(message.cart).total === 0)}
                                     >
                                       {bundleLoading ? (
                                         <span className="inline-flex items-center gap-2"><Loader2 className="h-4 w-4 animate-spin" /> Loading…</span>
                                       ) : (
-                                        'Go to cart'
+                                        'Go to Cart'
                                       )}
                                     </Button>
                                   </div>
@@ -1643,7 +1794,7 @@ const ChatWidget = () => {
                       onChange={(e) => setInputValue(e.target.value)}
                       onKeyPress={handleKeyPress}
                       placeholder="Type your message..."
-                      className="flex-1 border-gray-300 focus:border-primary"
+                      className="flex-1 border-gray-300 focus:border-primary transition-all duration-200 focus:-translate-y-0.5 focus:shadow-[0_0_0_4px_rgba(0,0,0,0.08)]"
                       disabled={isLoading}
                     />
                     <Button

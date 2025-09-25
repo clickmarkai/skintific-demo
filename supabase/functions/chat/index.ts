@@ -1211,14 +1211,17 @@ serve(async (req) => {
       })(); } catch {}
 
       // Product recommendation clarifier: try to produce structured recommendations
-      const productKeyword = /\b(recommend|suggest|show|need|want|looking for|moistur|serum|cleanser|sunscreen|toner|skincare|make\s?up|makeup|product|acne|oily|dry|sensitive|brighten|brightening|hyperpig|wrinkle|aging|anti-?aging|dark\s?spots?|blemish|pores?|blackheads?|whiteheads?|oil\s?control)\b/i;
-      const looksLikeProductQuery = productKeyword.test(message);
+      // Narrower detection so non-product questions (e.g., "how many categories ...") don't trigger
+      const typeOrConcern = /(moistur|serum|cleanser|sunscreen|toner|mask|spf|acne|oily|dry|sensitive|brighten|brightening|hyperpig|wrinkle|aging|anti-?aging|dark\s?spots?|blemish|pores?|blackheads?|whiteheads?|oil\s?control)/i;
+      const buyOrRecommend = /(recommend|suggest|show\b|need|want|looking\s*for|buy|price|budget)/i;
+      const looksLikeProductQuery = typeOrConcern.test(message) || buyOrRecommend.test(message);
       const askedClarifierRecentlyLocal = [...history]
         .reverse()
         .slice(0, 6)
-        .some((m: any) => m.role === 'assistant' && /((product|skincare)\s*type|skin\s*type|skin\s*concerns?|price\s*range|help\s*me\s*recommend|recommend\s+the\s+best)/i.test(String(m.content || '')));
-      const priorUserProductSignal = [...history].reverse().slice(1,6).some((m: any) => m.role === 'user' && productKeyword.test(String(m.content || '')));
-      if (looksLikeProductQuery || askedClarifierRecentlyLocal || priorUserProductSignal) {
+        .some((m: any) => m.role === 'assistant' && /(product\s*type|skincare\s*type|skin\s*concerns?|price\s*range|help\s*me\s*recommend|recommend\s+the\s+best)/i.test(String(m.content || '')));
+      // Follow-up to clarifier if user provides concerns/budget/type without explicitly asking for products
+      const isClarifierFollowup = /(acne|oily|dry|sensitive|brighten|dark\s*spots?|aging|wrinkle|pore|blackheads?|whiteheads?|hydrating|soothing|calming|barrier|redness|under|below|budget|idr|rp|usd|\$\s?\d+|\d+\s?(k|rb|ribu)|\b(serum|moisturizer|moisturiser|cleanser|sunscreen|spf|toner|mask)\b)/i.test(message);
+      if (looksLikeProductQuery || (askedClarifierRecentlyLocal && isClarifierFollowup)) {
         // LLM-based specificity check using full chat history
         let shouldAskClarifier = false;
         try {
@@ -1347,11 +1350,13 @@ serve(async (req) => {
         }
       } catch {}
 
-      // Do NOT auto-show products for greetings or very short messages
+      // Do NOT auto-show products for greetings, very short messages, or when the user isn't clearly asking about products
       try {
         const trimmed = String(message || '').trim();
         const looksLikeGreeting = /^(hi|hello|hey|halo|hai|yo|hiya|sup)\b/i.test(trimmed);
-        if (!looksLikeGreeting && trimmed.length >= 6) {
+        // Heuristic: only fallback to products if text clearly indicates shopping intent or mentions a type/concern (avoid generic 'product'/'skincare')
+        const productish = /(moistur|serum|cleanser|toner|mask|sunscreen|spf|recommend|suggest|buy|price|budget|under|idr|rp|usd)/i.test(trimmed);
+        if (!looksLikeGreeting && trimmed.length >= 6 && productish) {
           const fallbackProducts = await searchProductsSmart(message, 6);
           if (fallbackProducts && fallbackProducts.length) {
             const reply = 'Here are the recommended products below.';
