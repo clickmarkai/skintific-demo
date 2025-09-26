@@ -179,7 +179,7 @@ Rules:
         { role: 'user', content: 'Write how this product addresses the user needs if possible.' }
       ],
       temperature: 0.4,
-      max_tokens: 120
+      max_tokens: 220
     } as const;
 
     const res = await fetch('https://api.openai.com/v1/chat/completions', {

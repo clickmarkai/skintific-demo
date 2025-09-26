@@ -479,9 +479,9 @@ useEffect(() => {
       }
 
       if (addResp?.cart) {
-        upsertCartMessage({ text: 'Bundle added to cart.', cart: addResp.cart });
-        // Broadcast sync so Cart page updates immediately
-        markCartUpdated(0);
+        await upsertCartMessage({ text: 'Bundle added to cart.', cart: addResp.cart });
+        // Delay broadcast slightly to avoid stale snapshot overriding the fresh UI
+        markCartUpdated(600);
       } else if (!addResp?.cart) {
         // Fallback: add or update each line individually with discounted price
         const discountPercent = Number(bundle?.discount_percent || 10);
@@ -541,23 +541,23 @@ useEffect(() => {
           if (supabase) {
             const { data: d } = await (supabase as any).functions.invoke('chat', { body: { intent: 'get_cart_info', session_id: currentSessionId, user_id: user?.id || 'anonymous' } });
             if (d?.cart) {
-              upsertCartMessage({ text: 'Bundle added to cart.', cart: d.cart });
-              markCartUpdated(0);
+              await upsertCartMessage({ text: 'Bundle added to cart.', cart: d.cart });
+              markCartUpdated(600);
             }
           } else if (SUPABASE_FUNCTION_URL) {
             const r3 = await fetch(SUPABASE_FUNCTION_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ intent: 'get_cart_info', session_id: currentSessionId, user_id: user?.id || 'anonymous' }) });
             if (r3.ok) {
               const d = await r3.json();
               if (d?.cart) {
-                upsertCartMessage({ text: 'Bundle added to cart.', cart: d.cart });
-                markCartUpdated(0);
+                await upsertCartMessage({ text: 'Bundle added to cart.', cart: d.cart });
+                markCartUpdated(600);
               }
             }
           }
         } catch {}
       } else if (data?.cart) {
-        upsertCartMessage({ text: 'Bundle added to cart.', cart: data.cart });
-        markCartUpdated(0);
+        await upsertCartMessage({ text: 'Bundle added to cart.', cart: data.cart });
+        markCartUpdated(600);
       }
       try { localStorage.setItem('bundle_applied', '1'); } catch {}
       // Navigate to cart page after success
@@ -1690,7 +1690,7 @@ useEffect(() => {
                                       {(p.description || (p.benefits && p.benefits.length > 0)) && (
                                         <div className="mt-2 text-xs text-gray-700">
                                           {p.description ? (
-                                            <p>{p.description}</p>
+                                            <p className="whitespace-pre-wrap break-words">{p.description}</p>
                                           ) : (
                                             <ul className="list-disc ml-4">
                                               {p.benefits!.slice(0, 5).map((b, i) => (<li key={i}>{b}</li>))}
