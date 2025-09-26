@@ -136,7 +136,7 @@ async function generateShortDescription(p: {
   benefits?: string[];
   ingredients?: string[];
   price_cents?: number;
-}): Promise<string | undefined> {
+}, opts?: { concerns?: string[]; userType?: string | undefined }): Promise<string | undefined> {
   if (!OPENAI_API_KEY) return undefined;
   try {
     const name = (p.name || '').toString().slice(0, 120);
@@ -153,6 +153,9 @@ Rules:
 - Use neutral, informative tone
 - Do not invent features or clinical claims
 - No external brand mentions
+- Do not repeat the product name verbatim; avoid brand words like "skintific"
+- Explicitly connect to the user's concerns when provided (e.g., oily → controls oil/shine; acne → helps clarify; dry → replenishes hydration; sensitive → gentle)
+- End with a complete sentence (period).
 - If data is sparse, keep it generic but helpful`;
 
     const details = {
@@ -162,16 +165,21 @@ Rules:
       benefits,
       ingredients,
       price_idr: price != null ? Math.round(price / 100) * 100 : undefined,
+      user_needs: {
+        concerns: (opts?.concerns || []).slice(0, 2),
+        requested_type: opts?.userType || undefined
+      }
     };
 
     const body = {
       model: CHAT_MODEL,
       messages: [
         { role: 'system', content: sys },
-        { role: 'user', content: `Product data (JSON): ${JSON.stringify(details)}` }
+        { role: 'user', content: `Product data (JSON): ${JSON.stringify(details)}` },
+        { role: 'user', content: 'Write how this product addresses the user needs if possible.' }
       ],
       temperature: 0.4,
-      max_tokens: 90
+      max_tokens: 120
     } as const;
 
     const res = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -181,12 +189,74 @@ Rules:
     });
     if (!res.ok) return undefined;
     const data = await res.json();
-    const text = (data?.choices?.[0]?.message?.content || '').toString().trim();
+    let text = (data?.choices?.[0]?.message?.content || '').toString().trim();
     if (!text) return undefined;
-    // Safety: clamp length
-    return text.slice(0, 220);
+    // Ensure it ends cleanly with punctuation
+    if (!/[.!?]$/.test(text)) text = text + '.';
+
+    // If the blurb forgot to mention the key concern, append a short tail sentence
+    const lower = text.toLowerCase();
+    const c = (opts?.concerns || []).map(s => String(s).toLowerCase());
+    const addTail = (tail: string) => { if (!lower.includes(tail.toLowerCase().split(' ')[0])) text += ' ' + tail; };
+    if (c.includes('oily')) addTail('Ideal for oily skin, helping control excess oil and shine.');
+    if (c.includes('acne') || c.includes('acne-prone')) addTail('Supports clearer-looking, acne-prone skin.');
+    if (c.includes('dry') || c.includes('dehydrated')) addTail('Replenishes hydration for dry skin.');
+    if (c.includes('sensitive')) addTail('Gentle enough for sensitive skin.');
+    if (c.includes('brightening') || c.includes('dark spot') || c.includes('hyperpigmentation')) addTail('Promotes a brighter, more even look.');
+
+    return text;
   } catch {
     return undefined;
+  }
+}
+
+// Create a short heading based on user's needs remembered from chat
+async function generateNeedBasedHeading(mem: Memory, requestedType?: string, concerns?: string[]): Promise<string> {
+  const baseFallback = 'Here are the recommended products below.';
+  try {
+    const allConcerns = Array.from(new Set([...(concerns || []), ...((mem.concerns || []) as string[])]))
+      .filter(Boolean)
+      .slice(0, 2);
+    const type = (requestedType || (mem.preferred_types && mem.preferred_types[0]) || '').toString();
+
+    if (!OPENAI_API_KEY) {
+      const parts: string[] = [];
+      if (type) parts.push(type);
+      let s = parts.length ? `Here are ${parts[0]} picks` : 'Here are recommendations';
+      if (allConcerns.length) s += ` for ${allConcerns.join(' & ')}`;
+      if (mem.budget_max_cents != null) s += ' within your budget';
+      return s + '.';
+    }
+
+    const sys = `Write a single-sentence heading for skincare product recommendations.
+Rules:
+- Max 18 words, plain sentence
+- If product type exists, include it (serum, moisturizer, etc.)
+- Include up to two user concerns if available (oily, acne, brightening, etc.)
+- Optionally hint at budget if provided ("within your budget").
+- No brand names or emojis.`;
+
+    const payload = {
+      model: CHAT_MODEL,
+      messages: [
+        { role: 'system', content: sys },
+        { role: 'user', content: JSON.stringify({ type, concerns: allConcerns, budget_max_cents: mem.budget_max_cents ?? null }) }
+      ],
+      temperature: 0.3,
+      max_tokens: 40
+    } as const;
+
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_API_KEY}` },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) return baseFallback;
+    const j = await res.json();
+    const text = (j?.choices?.[0]?.message?.content || '').toString().trim();
+    return text || baseFallback;
+  } catch {
+    return baseFallback;
   }
 }
 
@@ -416,7 +486,7 @@ async function searchProducts(
         price_cents: Math.round(Number(price) * 100),
         image_url: img || undefined,
         description: typeof md.description === 'string' && md.description ? md.description
-                    : (typeof row.content === 'string' ? String(row.content).slice(0, 200) : undefined),
+                    : (typeof row.content === 'string' ? String(row.content) : undefined),
         tags: Array.isArray(md.tags) ? md.tags.filter((t: any) => typeof t === 'string') : [],
         images: Array.isArray(md.images) ? md.images.map((im: any) => im?.src || im).filter(Boolean).slice(0, 5) : undefined,
         benefits: Array.isArray(md.benefits) ? md.benefits : undefined,
@@ -457,14 +527,14 @@ async function searchProducts(
 
     products.sort((a, b) => score(b) - score(a));
 
-    // Fill missing descriptions for the top N with a short LLM-generated blurb
+    // Generate concise LLM descriptions for the top N so carousel shows uniform blurbs
     const top = products.slice(0, limit);
     if (OPENAI_API_KEY) {
+      const concernsForDesc = Array.from(new Set((mem.concerns || []).map(s => String(s))));
+      const userType = requestedType || mem.preferred_types?.[0];
       await Promise.all(top.map(async (p) => {
-        if (!p.description || String(p.description).trim().length < 20) {
-          const desc = await generateShortDescription(p);
-          if (desc) p.description = desc;
-        }
+        const desc = await generateShortDescription(p, { concerns: concernsForDesc, userType });
+        if (desc) p.description = desc;
       }));
     }
 
@@ -772,7 +842,8 @@ serve(async (req) => {
           }
           
           if (products.length > 0) {
-            const reply = 'Here are the recommended products below.';
+            const mem = await synthesizeMemoryFromHistory(history);
+            const reply = await generateNeedBasedHeading(mem, v.requestedType, v.concerns);
             await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', reply);
             return new Response(JSON.stringify({ output: reply, products }), { headers });
           }
@@ -822,7 +893,8 @@ serve(async (req) => {
         if (v.hasNeeds && v.allowsProductNames) {
           const products = await searchProducts(message, v.requestedType, 6);
           if (products.length > 0) {
-            const reply = 'Here are the recommended products below.';
+            const mem = await synthesizeMemoryFromHistory(history);
+            const reply = await generateNeedBasedHeading(mem, v.requestedType, v.concerns);
             await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', reply);
             return new Response(JSON.stringify({ output: reply, products }), { headers });
           }

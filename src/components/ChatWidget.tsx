@@ -1690,11 +1690,11 @@ useEffect(() => {
                                       {(p.description || (p.benefits && p.benefits.length > 0)) && (
                                         <div className="mt-2 text-xs text-gray-700">
                                           {p.description ? (
-                                            <p className="line-clamp-3">{p.description}</p>
+                                            <p>{p.description}</p>
                                           ) : (
                                             <ul className="list-disc ml-4">
-                                              {p.benefits!.slice(0, 3).map((b, i) => (<li key={i}>{b}</li>))}
-                                        </ul>
+                                              {p.benefits!.slice(0, 5).map((b, i) => (<li key={i}>{b}</li>))}
+                                            </ul>
                                           )}
                                         </div>
                                       )}
