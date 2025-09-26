@@ -88,6 +88,108 @@ const detectIntent = (message: string): string => {
   return 'general';
 };
 
+// Lightweight heuristic for detecting skin concern mentions to trigger a clarifier
+const extractConcernsFromText = (message: string): string[] => {
+  const text = String(message || '').toLowerCase();
+  const concernMap = [
+    'oily','dry','dehydrated','combination','sensitive','acne','acne-prone','breakout','pimples','blackheads','whiteheads','comedones',
+    'dull','brightening','dark spot','hyperpigmentation','pigment','uneven tone','texture','wrinkle','fine line','aging',
+    'redness','irritation','rosacea','large pores','pore','clogged pores','shine','sebum'
+  ];
+  const found = new Set<string>();
+  for (const c of concernMap) {
+    if (text.includes(c)) found.add(c.replace(/\s+/g, ' '));
+  }
+  return Array.from(found);
+};
+
+function applyProductIntentHeuristic(validation: {
+  isProductIntent: boolean;
+  hasNeeds: boolean;
+  needsClarifier: boolean;
+  requestedType?: string;
+  concerns?: string[];
+  allowsProductNames: boolean;
+  isInScope: boolean;
+  needsTicket: boolean;
+  explicitShowRequest: boolean;
+  showRequestType?: string;
+}, message: string) {
+  const concerns = extractConcernsFromText(message);
+  if (!validation.isProductIntent && concerns.length > 0) {
+    return {
+      ...validation,
+      isProductIntent: true,
+      hasNeeds: false,
+      needsClarifier: true,
+      concerns: Array.from(new Set([...(validation.concerns || []), ...concerns]))
+    };
+  }
+  return validation;
+}
+
+// Generate a short product description with the LLM based on available product metadata
+async function generateShortDescription(p: {
+  name?: string;
+  type?: string;
+  tags?: string[];
+  benefits?: string[];
+  ingredients?: string[];
+  price_cents?: number;
+}): Promise<string | undefined> {
+  if (!OPENAI_API_KEY) return undefined;
+  try {
+    const name = (p.name || '').toString().slice(0, 120);
+    const type = (p.type || '').toString().slice(0, 60);
+    const tags = (p.tags || []).filter(Boolean).slice(0, 8);
+    const benefits = (p.benefits || []).filter(Boolean).slice(0, 8);
+    const ingredients = (p.ingredients || []).filter(Boolean).slice(0, 8);
+    const price = typeof p.price_cents === 'number' ? Math.max(0, p.price_cents) : undefined;
+
+    const sys = `Write a concise, shopper-friendly product blurb for an ecommerce skincare item.
+Rules:
+- 1–2 short sentences, max ~40 words total
+- Focus on benefits and skin feel, avoid medical claims
+- Use neutral, informative tone
+- Do not invent features or clinical claims
+- No external brand mentions
+- If data is sparse, keep it generic but helpful`;
+
+    const details = {
+      name,
+      type,
+      tags,
+      benefits,
+      ingredients,
+      price_idr: price != null ? Math.round(price / 100) * 100 : undefined,
+    };
+
+    const body = {
+      model: CHAT_MODEL,
+      messages: [
+        { role: 'system', content: sys },
+        { role: 'user', content: `Product data (JSON): ${JSON.stringify(details)}` }
+      ],
+      temperature: 0.4,
+      max_tokens: 90
+    } as const;
+
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_API_KEY}` },
+      body: JSON.stringify(body)
+    });
+    if (!res.ok) return undefined;
+    const data = await res.json();
+    const text = (data?.choices?.[0]?.message?.content || '').toString().trim();
+    if (!text) return undefined;
+    // Safety: clamp length
+    return text.slice(0, 220);
+  } catch {
+    return undefined;
+  }
+}
+
 const fetchCartItems = async (cartId: string): Promise<Cart> => {
   try {
     const supabase = createClient(
@@ -267,9 +369,13 @@ EXPLICIT SHOW REQUESTS:
       isProductIntent: true,
       hasNeeds: true,
       needsClarifier: false,
+      requestedType: undefined,
+      concerns: [],
       allowsProductNames: true,
       isInScope: true,
       needsTicket: false,
+      explicitShowRequest: false,
+      showRequestType: undefined,
     };
   }
 }
@@ -350,7 +456,19 @@ async function searchProducts(
     };
 
     products.sort((a, b) => score(b) - score(a));
-    return products.slice(0, limit);
+
+    // Fill missing descriptions for the top N with a short LLM-generated blurb
+    const top = products.slice(0, limit);
+    if (OPENAI_API_KEY) {
+      await Promise.all(top.map(async (p) => {
+        if (!p.description || String(p.description).trim().length < 20) {
+          const desc = await generateShortDescription(p);
+          if (desc) p.description = desc;
+        }
+      }));
+    }
+
+    return top;
   } catch {
     return [];
   }
@@ -449,25 +567,68 @@ serve(async (req) => {
         const requestedImage = body.image_url;
         
         if (intent === 'delete_line') {
-          const { data: lines } = await supabaseSrv
-            .from('cart_products')
-            .select('id')
-            .eq('cart_id', cartId)
-            .or(`variant_id.eq.${requestedVariantId || 'null'},product_id.eq.${requestedProductId || 'null'},title_snapshot.eq.${requestedProductName || 'null'}`)
-            .limit(1);
-          
-          if (lines && lines.length > 0) {
-            await supabaseSrv.from('cart_products').delete().eq('id', lines[0].id);
+          // Precise matching to avoid over-deletion: try variant_id, then product_id, then exact title
+          let target: any = null;
+          if (requestedVariantId) {
+            const { data } = await supabaseSrv
+              .from('cart_products')
+              .select('id')
+              .eq('cart_id', cartId)
+              .eq('variant_id', requestedVariantId)
+              .limit(1);
+            target = (data || [])[0] || null;
+          }
+          if (!target && requestedProductId) {
+            const { data } = await supabaseSrv
+              .from('cart_products')
+              .select('id')
+              .eq('cart_id', cartId)
+              .eq('product_id', requestedProductId)
+              .limit(1);
+            target = (data || [])[0] || null;
+          }
+          if (!target && requestedProductName) {
+            const { data } = await supabaseSrv
+              .from('cart_products')
+              .select('id')
+              .eq('cart_id', cartId)
+              .eq('title_snapshot', requestedProductName)
+              .limit(1);
+            target = (data || [])[0] || null;
+          }
+          if (target?.id) {
+            await supabaseSrv.from('cart_products').delete().eq('id', target.id);
           }
         } else {
-          const { data: existing } = await supabaseSrv
-            .from('cart_products')
-            .select('id, qty')
-            .eq('cart_id', cartId)
-            .or(`variant_id.eq.${requestedVariantId || 'null'},product_id.eq.${requestedProductId || 'null'},title_snapshot.eq.${requestedProductName || 'null'}`)
-            .limit(1);
-          
-          const existingLine = existing && existing.length > 0 ? existing[0] : null;
+          // Precise lookup for existing line to edit/add: variant_id → product_id → title
+          let existingLine: any = null;
+          if (requestedVariantId) {
+            const { data } = await supabaseSrv
+              .from('cart_products')
+              .select('id, qty')
+              .eq('cart_id', cartId)
+              .eq('variant_id', requestedVariantId)
+              .limit(1);
+            existingLine = (data || [])[0] || null;
+          }
+          if (!existingLine && requestedProductId) {
+            const { data } = await supabaseSrv
+              .from('cart_products')
+              .select('id, qty')
+              .eq('cart_id', cartId)
+              .eq('product_id', requestedProductId)
+              .limit(1);
+            existingLine = (data || [])[0] || null;
+          }
+          if (!existingLine && requestedProductName) {
+            const { data } = await supabaseSrv
+              .from('cart_products')
+              .select('id, qty')
+              .eq('cart_id', cartId)
+              .eq('title_snapshot', requestedProductName)
+              .limit(1);
+            existingLine = (data || [])[0] || null;
+          }
           
           if (existingLine) {
             const newQty = intent === 'add_line' 
@@ -592,12 +753,13 @@ serve(async (req) => {
       }
       
       // Handle product requests
-      if (validation.isProductIntent) {
+      const v = applyProductIntentHeuristic(validation, message);
+      if (v.isProductIntent) {
         // Handle explicit show requests first
-        if (validation.explicitShowRequest) {
+        if (v.explicitShowRequest) {
           let products: any[] = [];
           
-          if (validation.showRequestType === 'one_each_category') {
+          if (v.showRequestType === 'one_each_category') {
             // Show one product from each category
             const categories = ['serum', 'moisturizer', 'cleanser', 'sunscreen', 'toner', 'mask'];
             for (const cat of categories) {
@@ -606,7 +768,7 @@ serve(async (req) => {
             }
           } else {
             // Default: show recent/popular products
-            products = await searchProducts(message, validation.requestedType, 6, { sessionId, userId: body.user_id });
+            products = await searchProducts(message, v.requestedType, 6, { sessionId, userId: body.user_id });
           }
           
           if (products.length > 0) {
@@ -616,14 +778,14 @@ serve(async (req) => {
           }
         }
         
-        if (validation.needsClarifier) {
+        if (v.needsClarifier) {
           // Generate dynamic clarifier question
           let ask = 'To recommend the best fit, could you share the product type and your skin concerns?';
           if (OPENAI_API_KEY) {
             try {
               const missing: string[] = [];
-              if (!validation.requestedType) missing.push('product type (serum, moisturizer, cleanser, etc.)');
-              if (!validation.concerns?.length) missing.push('skin concerns (oily, acne, brightening, etc.)');
+              if (!v.requestedType) missing.push('product type (serum, moisturizer, etc.)');
+              if (!v.concerns?.length) missing.push('skin concerns (oily, acne, brightening, etc.)');
               
               const clarifierSys = `Generate a short, friendly clarifying question for a skincare assistant. Ask ONLY for the missing details: ${missing.join(' and ')}. Be conversational and avoid templates. One sentence only.`;
               const clarifierBody = {
@@ -657,8 +819,8 @@ serve(async (req) => {
           return new Response(JSON.stringify({ output: ask }), { headers });
         }
         
-        if (validation.hasNeeds && validation.allowsProductNames) {
-          const products = await searchProducts(message, validation.requestedType, 6);
+        if (v.hasNeeds && v.allowsProductNames) {
+          const products = await searchProducts(message, v.requestedType, 6);
           if (products.length > 0) {
             const reply = 'Here are the recommended products below.';
             await logEvent(supabaseSrv, sessionId, body.user_id, 'assistant', reply);
